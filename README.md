@@ -19,9 +19,11 @@ distributed separately) and `CONSTANTS.md` for the sourced parameters.
 |-------|------|-------|
 | 0 | Repo setup; port dynamics / observation noise / Brahe setup | done |
 | 1 | Chan (1997) Pc + cross-validation vs Python reference | done |
-| 2+ | Conjunction generator, Σ(τ) table, Kalman tracker, MCTS, chance constraint | not started |
+| 2 | Conjunction generator (head-on / cross-track) + Pc sanity check | done |
+| 3+ | Σ(τ) table, Kalman tracker, MCTS, chance constraint | not started |
 
-Only Phases 0–1 have reproducible results as of this commit.
+Only Phases 0–2 have reproducible results as of this commit. (Proximity-ops
+geometry is deferred — see `notes/TODOS.md`.)
 
 ## Layout
 
@@ -38,6 +40,7 @@ src/
     computePc.jl                   Pc methods: Chan (1997), Foster, Monte Carlo
   tests/
     test_chan_crossvalidation.jl   Julia-vs-Python Chan cross-validation
+    test_conjunction_generator.jl  conjunction geometry + Pc-vs-miss sanity check
 CONSTANTS.md                       every physical constant + its source
 figures/                           generated figures (local; not tracked in git)
 ```
@@ -109,3 +112,33 @@ this test requires:
   layout differs.)
 - `PyCall` able to import `brahe` (see Setup) for the orientation group; that
   group is skipped with a warning if Brahe is unavailable.
+
+### Phase 2 — conjunction generator sanity check
+
+Confirms the deterministic conjunction generator in
+`src/utils/genConjunctions.jl` (`sc1_eci_at_tca`, `place_debris_at_tca`,
+`generate_conjunction_geometry`) places a debris object at TCA with the
+requested miss distance and geometry, and that the resulting geometry feeds
+sensibly into the Phase 1 Chan Pc.
+
+```bash
+julia --project=. src/tests/test_conjunction_generator.jl
+```
+
+The test runs three groups, all of which must pass (57 checks total):
+
+- **Geometry construction** — the generated relative RTN state puts a head-on
+  miss on the along-track axis and a cross-track miss on the radial axis, with
+  the miss magnitude matching the request to sub-meter accuracy after the
+  RTN→ECI round trip.
+- **Pc vs miss distance** — Chan Pc is highest at the smallest miss, monotone
+  non-increasing across a miss sweep, and negligible (<1e-6) at 50 km, for both
+  geometries. The absolute peak Pc is modest (~0.07) because the combined
+  hard-body radius (~20 m) is small next to the tens-of-meters combined
+  position 1σ — the *trend* is the sanity check, not the peak value.
+- **Determinism** — regenerating the same `(geometry, miss, v_rel)` returns
+  byte-identical states (no hidden RNG).
+
+This test only needs `PyCall` able to import `brahe` (see Setup); it is skipped
+with a warning if Brahe is unavailable. It does not need the `ProbofCollision`
+Python environment.
