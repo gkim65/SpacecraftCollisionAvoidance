@@ -1,1 +1,6 @@
 *.png
+src/.DS_Store
+CLAUDE.md
+notes/*
+CONSTANTS.md
+src/quickprobcollision.ipynb

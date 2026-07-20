@@ -205,6 +205,120 @@ function compute_pc_mc(pomdp::SpacecraftCAPOMDP,
 end
 
 # -------------------------------------------------------
+# Chan (1997) closed-form Pc
+#
+# Ported from ProbofCollision/src/collision/chan1997.py, which was validated
+# against Fowler (1993) numerical integration to ~0.2% (see
+# ProbofCollision/FINDINGS.md). This is a faithful port: same encounter-plane
+# construction, same 2D projection, same noncentral-chi-squared series, so that
+# it cross-validates against the Python reference on identical inputs.
+#
+# Reference: Chan, F.K. (1997), "Spacecraft Collision Probability," AAS 97-173.
+# -------------------------------------------------------
+
+"""
+    chan_pc(sc1_eci, sc2_eci, cov1, cov2, hard_body_radius) -> Float64
+
+Analytic probability of collision via the Chan (1997) series expansion.
+
+Evaluates the same 2D-Gaussian-over-disk integral as the Foster/Fowler method
+but in closed form, via the noncentral chi-squared CDF. Inputs are ECI states
+and full 6x6 ECI covariances at TCA; only the 3x3 position blocks are used.
+
+Arguments
+- `sc1_eci`, `sc2_eci` : 6-element ECI states at TCA (m, m/s)
+- `cov1`, `cov2`       : 6x6 ECI position-velocity covariances (m^2, ...)
+- `hard_body_radius`   : combined hard-body radius of both objects (m)
+
+Returns Pc in [0, 1]. Throws if the relative speed at TCA is zero (the
+encounter plane is undefined).
+"""
+function chan_pc(sc1_eci::AbstractVector, sc2_eci::AbstractVector,
+                 cov1::AbstractMatrix, cov2::AbstractMatrix,
+                 hard_body_radius::Real)
+
+    r1 = sc1_eci[1:3]; v1 = sc1_eci[4:6]
+    r2 = sc2_eci[1:3]; v2 = sc2_eci[4:6]
+
+    r_rel = r1 .- r2
+    v_rel = v1 .- v2
+
+    v_rel_mag = norm(v_rel)
+    if v_rel_mag == 0.0
+        error("Relative speed at TCA is zero — encounter plane is undefined.")
+    end
+
+    # ------------------------------------------------------------------
+    # 1. Encounter-plane orthonormal basis (identical to chan1997.py)
+    # ------------------------------------------------------------------
+    z_hat = v_rel ./ v_rel_mag
+
+    r_perp = r_rel .- dot(r_rel, z_hat) .* z_hat
+    r_perp_mag = norm(r_perp)
+
+    if r_perp_mag < 1e-10
+        arbitrary = [1.0, 0.0, 0.0]
+        if abs(dot(arbitrary, z_hat)) > 0.9
+            arbitrary = [0.0, 1.0, 0.0]
+        end
+        r_perp = arbitrary .- dot(arbitrary, z_hat) .* z_hat
+        r_perp_mag = norm(r_perp)
+    end
+
+    x_hat = r_perp ./ r_perp_mag
+    y_hat = cross(z_hat, x_hat)
+
+    # ------------------------------------------------------------------
+    # 2. Combined position covariance and 2D projection
+    # ------------------------------------------------------------------
+    C_pos = cov1[1:3, 1:3] .+ cov2[1:3, 1:3]   # (3, 3)
+    B = permutedims(hcat(x_hat, y_hat))         # (2, 3), rows = [x_hat; y_hat]
+    C_2d = B * C_pos * transpose(B)             # (2, 2)
+    miss_2d = B * r_rel                         # (2,)
+
+    # ------------------------------------------------------------------
+    # 3. Chan (1997) series
+    # ------------------------------------------------------------------
+    return _chan_series(miss_2d, C_2d, hard_body_radius)
+end
+
+"""
+    _chan_series(miss, cov, radius) -> Float64
+
+Integral of a 2D Gaussian (mean=`miss`, covariance=`cov`) over a disk of
+`radius` centred at the origin, via diagonalisation to principal axes and the
+Chan (1997) noncentral-chi-squared result:
+
+    u  = (x0/σ1)^2 + (y0/σ2)^2      (Mahalanobis noncentrality)
+    v  = R^2 / σ1^2                  (normalised HBR^2 on the smaller axis)
+    Pc = (σ1/σ2) * ncx2.cdf(v; df=2, nc=u)
+"""
+function _chan_series(miss::AbstractVector, cov::AbstractMatrix, radius::Real)
+    # eigen on a Symmetric matrix returns ascending eigenvalues (σ1^2 ≤ σ2^2),
+    # matching numpy.linalg.eigh in the Python reference.
+    F = eigen(Symmetric(cov))
+    s1_sq = F.values[1]   # smaller variance
+    s2_sq = F.values[2]   # larger  variance
+
+    if s1_sq <= 0.0 || s2_sq <= 0.0
+        return 0.0
+    end
+
+    # Miss vector in the principal-axis frame: eigvecs' * miss
+    miss_p = transpose(F.vectors) * miss
+    x0 = miss_p[1]
+    y0 = miss_p[2]
+
+    u = x0^2 / s1_sq + y0^2 / s2_sq   # total Mahalanobis noncentrality
+    v = radius^2 / s1_sq               # normalised HBR^2 (smaller axis)
+
+    aniso_correction = sqrt(s1_sq / s2_sq)   # σ1/σ2 ≤ 1
+
+    pc = aniso_correction * cdf(NoncentralChisq(2, u), v)
+    return clamp(pc, 0.0, 1.0)
+end
+
+# -------------------------------------------------------
 # Dispatcher
 # -------------------------------------------------------
 
