@@ -41,6 +41,7 @@ src/
   tests/
     test_chan_crossvalidation.jl   Julia-vs-Python Chan cross-validation
     test_conjunction_generator.jl  conjunction geometry + Pc-vs-miss sanity check
+    test_from_orbits.jl            orbit-first closest-approach round-trip verification
 CONSTANTS.md                       every physical constant + its source
 figures/                           generated figures (local; not tracked in git)
 ```
@@ -142,3 +143,40 @@ The test runs three groups, all of which must pass (57 checks total):
 This test only needs `PyCall` able to import `brahe` (see Setup); it is skipped
 with a warning if Brahe is unavailable. It does not need the `ProbofCollision`
 Python environment.
+
+### Phase 2 — orbit-first closest-approach verification
+
+Confirms that the geometry-first placements from `generate_conjunction_geometry`
+are *dynamically real*. The orbit-first machinery in `src/utils/genConjunctions.jl`
+(`_closest_approach`, `_reduce_rel_to_params`, `make_conjunction_from_orbits`)
+turns a pair of Keplerian orbits into a dynamically-verified conjunction: it
+propagates both objects under the accurate force model (drag/SRP) over a ±600 s
+window around TCA and finds the true closest approach via a coarse
+closing-speed-adaptive grid plus a golden-section refine (ported from RSSDA,
+wired to this repo's accurate dynamics instead of RSSDA's two-body model).
+
+```bash
+julia --project=. src/tests/test_from_orbits.jl
+```
+
+The test round-trips `generate_conjunction_geometry` → ECI-to-KOE →
+`make_conjunction_from_orbits` and checks (38 checks total):
+
+- **Cross-track round trip** — the requested radial standoff is perpendicular to
+  the along-track closing velocity, so the placement instant *is* the closest
+  approach: the Brahe-measured true miss recovers the requested miss to <1 mm
+  and the closest approach lands at TCA (|t_ca| < 1 s).
+- **Head-on round trip** — the requested offset is *along-track*, parallel to the
+  closing velocity, so the objects fly through: the true closest approach is far
+  smaller than the requested offset and occurs ~`offset / v_rel` seconds off TCA.
+  This is the correct dynamical answer, and the test asserts it.
+- **Feasibility guard** — an obviously hyperbolic (e > 1), non-LEO (apogee above
+  the ceiling), or over-eccentric secondary orbit is flagged infeasible with a
+  reason string.
+
+The tests use an along-track `v_rel` of 15 m/s (RSSDA's co-orbital default). A
+larger along-track `v_rel` (e.g. the Phase 2 sanity-sweep's 200 m/s) drops the
+debris perigee below the atmosphere and the guard correctly rejects it — a true
+fast LEO crossing is a *cross-track* velocity, not an along-track one. Same
+Brahe-only dependency as the other tests; skipped with a warning if Brahe is
+unavailable.
