@@ -20,9 +20,10 @@ distributed separately) and `CONSTANTS.md` for the sourced parameters.
 | 0 | Repo setup; port dynamics / observation noise / Brahe setup | done |
 | 1 | Chan (1997) Pc + cross-validation vs Python reference | done |
 | 2 | Conjunction generator (head-on / cross-track) + Pc sanity check | done |
-| 3+ | Σ(τ) table, Kalman tracker, MCTS, chance constraint | not started |
+| 3 | Precomputed Σ(τ) covariance-vs-time-remaining table + Pc-trust check | done |
+| 4+ | Kalman tracker, MCTS, chance constraint | not started |
 
-Only Phases 0–2 have reproducible results as of this commit. (Proximity-ops
+Only Phases 0–3 have reproducible results as of this commit. (Proximity-ops
 geometry is deferred — see `notes/TODOS.md`.)
 
 ## Layout
@@ -38,10 +39,12 @@ src/
   utils/
     genConjunctions.jl             Brahe / PyCall setup, conjunction generation
     computePc.jl                   Pc methods: Chan (1997), Foster, Monte Carlo
+    covarianceTable.jl             precomputed Σ(τ) table + Pc-through-Σ(τ) check
   tests/
     test_chan_crossvalidation.jl   Julia-vs-Python Chan cross-validation
     test_conjunction_generator.jl  conjunction geometry + Pc-vs-miss sanity check
     test_from_orbits.jl            orbit-first closest-approach round-trip verification
+    test_covariance_table.jl       Σ(τ) structure/health/growth + Pc-trust check
 CONSTANTS.md                       every physical constant + its source
 figures/                           generated figures (local; not tracked in git)
 ```
@@ -191,3 +194,51 @@ debris perigee below the atmosphere and the guard correctly rejects it — a tru
 fast LEO crossing is a *cross-track* velocity, not an along-track one. Same
 Brahe-only dependency as the other tests; skipped with a warning if Brahe is
 unavailable.
+
+### Phase 3 — precomputed Σ(τ) covariance table + Pc-trust check
+
+`src/utils/covarianceTable.jl` builds the offline covariance-vs-time-remaining
+table the belief-space planner looks up during search. `build_covariance_table`
+anchors each object's initial covariance (`P0_sc` / `P0_debris`) at TCA with
+Brahe's STM machinery enabled and propagates it forward under the accurate force
+model (drag/SRP), reading `Σ(τ)` back at τ = `dt`, 2·`dt`, …, 24 hr remaining
+until TCA — for both the spacecraft and the debris, in both RTN and ECI frames.
+It reads Brahe's own propagated covariance (`covariance_rtn` / `covariance_gcrf`)
+directly; Phase 1 proved that equals the hand-computed `Φ Σ₀ Φᵀ` to 0.0 relative
+diff. The τ grid's step size is a **swappable `dt` argument** (defaults to
+`pomdp.dt`), so the 30-min and 1-hr grids can both be built and compared.
+`pc_through_table` then evaluates Chan Pc through the propagated `Σ(τ)` for a
+fixed conjunction — the Pc-trust check folded in from Phase 2.
+
+> **Validity:** this table is a pure lookup-by-time-remaining only under the
+> **noiseless-maneuver** assumption (architecture doc §5/§8). Once maneuver
+> execution uncertainty is added (Phase 8), Σ depends on the action sequence and
+> the table must be tracked per-node instead.
+
+```bash
+julia --project=. src/tests/test_covariance_table.jl
+```
+
+The test builds both grids (1-hr = 24 steps, 30-min = 48 steps) and checks (976
+checks total):
+
+- **Structure + health** — every `Σ(τ)`, both objects, both frames, is 6×6,
+  exactly symmetric, and positive-definite (Cholesky); `all_pd` holds and no
+  forced symmetrization is needed (Brahe output is symmetric to ~1e-11 rel).
+- **Growth** — along-track (RTN transverse) 1σ grows monotonically and stays
+  bounded (debris: ~1.56 km @1h → ~30.2 km @24h). The power-law exponent is ≈1
+  (σ ∝ τ, variance ∝ τ²), **not** the ~1.5 cubic-in-variance one might expect:
+  the τ³ signature comes from semi-major-axis (energy) error dominating, whereas
+  the current placeholder `P0` (per-axis position + velocity diagonal, no SMA
+  term) is *velocity*-error dominated — which is the correct growth for this
+  covariance. The exponent should move toward 1.5 once `P0` carries a real
+  SMA-uncertainty term (the Phase 4 SSN-noise decision).
+- **Pc-trust** — Chan Pc through `Σ(τ)` for a feasible co-orbital cross-track
+  conjunction (miss 500 m, `v_rel` 15 m/s) is finite, in `[0,1]`, and evolves
+  smoothly, rising sensibly toward TCA (9.4e-5 @24h → 1.65e-3 @1h) as the
+  ballooning covariance shrinks back toward the still-nonzero miss.
+- **Grid equivalence** — at every shared (whole-hour) τ the 30-min and 1-hr
+  tables agree, confirming Σ(τ) is a pure function of time-remaining,
+  independent of the step size used to build it.
+
+Same Brahe-only dependency as the other tests.

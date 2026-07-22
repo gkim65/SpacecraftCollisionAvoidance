@@ -9,6 +9,7 @@ using LinearAlgebra
 include("SpacecraftCAPOMDP.jl")
 include("utils/genConjunctions.jl")
 include("utils/computePc.jl")
+include("utils/covarianceTable.jl")
 
 include("states.jl")
 include("actions.jl")
