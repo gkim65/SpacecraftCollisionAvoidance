@@ -23,12 +23,16 @@ distributed separately) and `CONSTANTS.md` for the sourced parameters.
 | 3 | Precomputed Σ(τ) covariance-vs-time-remaining table + Pc-trust check | done |
 | 4 | Kalman predict/correct belief tracker (linear-Gaussian) | done |
 | 5 | Baseline belief-space MCTS skeleton (miss-distance reward, no Pc yet) | done |
-| 6+ | Chance constraint (Pc reward), baselines, experiments | not started |
+| 6 | Chance constraint: Pc-at-TCA reward + per-step constraint check | done |
+| 7+ | Closed-loop episode driver, baselines, experiments | not started |
 
-Only Phases 0–5 have reproducible results as of this commit. Phase 5 is the
-search-mechanics checkpoint: a hand-rolled belief-space MCTS running end-to-end
-on a **miss-distance-only** reward — the chance constraint (Pc) is Phase 6.
-(Proximity-ops geometry and the nonlinear SSN observation model are deferred —
+Only Phases 0–6 have reproducible results as of this commit. Phase 6 replaces
+the Phase-5 miss-distance placeholder with a **Pc-at-TCA reward** and a **per-step
+chance-constraint check** (Pc evaluated from each node's belief at every simulated
+step, penalized when Pc > threshold). The uncertainty model assumes a tracking
+measurement each decision step, so a node's Pc uses a fresh initial covariance
+grown over the *remaining* time to TCA. (The outer closed-loop episode driver,
+proximity-ops geometry, and the nonlinear SSN observation model are deferred —
 see `notes/TODOS.md`.)
 
 ## Layout
@@ -46,14 +50,14 @@ src/
     computePc.jl                   Pc methods: Chan (1997), Foster, Monte Carlo
     covarianceTable.jl             precomputed Σ(τ) table + Pc-through-Σ(τ) check
     beliefTracker.jl               Kalman predict/correct belief tracker (Phase 4)
-    beliefMCTS.jl                  baseline belief-space MCTS skeleton (Phase 5)
+    beliefMCTS.jl                  belief-space MCTS: Pc-at-TCA reward + chance constraint (Phase 5/6)
   tests/
     test_chan_crossvalidation.jl   Julia-vs-Python Chan cross-validation
     test_conjunction_generator.jl  conjunction geometry + Pc-vs-miss sanity check
     test_from_orbits.jl            orbit-first closest-approach round-trip verification
     test_covariance_table.jl       Σ(τ) structure/health/growth + Pc-trust check
     test_belief_tracker.jl         Kalman predict/correct: shrinkage, z-independence, x-val
-    test_belief_mcts.jl            MCTS mechanics: UCB, backup, widening, determinism, e2e
+    test_belief_mcts.jl            MCTS mechanics (UCB/backup/widening/determinism) + Pc reward & chance constraint
 CONSTANTS.md                       every physical constant + its source
 figures/                           generated figures (local; not tracked in git)
 ```
@@ -283,7 +287,7 @@ matches the Phase 3 `build_covariance_table` entry to <1e-9.
 
 Same Brahe-only dependency as the other tests.
 
-### Phase 5 — baseline belief-space MCTS skeleton (miss-distance reward)
+### Phase 5 — belief-space MCTS skeleton (search mechanics)
 
 `src/utils/beliefMCTS.jl` is the hand-rolled belief-space MCTS (architecture doc
 §4/§6) — **not** POMCPOW. A `BeliefNode` carries a Phase-4 `Belief`, the sampled
@@ -299,23 +303,55 @@ UCB/MaxUCB and widening rules and their constants (`c=1`, `k=10`, `α=0.5`,
 solver itself is not adopted, so the belief stays visible to the reward at every
 step (the whole point of §6).
 
-> **Phase 5 is the mechanics checkpoint.** The reward is **miss-distance-only**
-> (`step_reward`/`leaf_value`: reward larger miss at TCA, large collision
-> penalty, per-maneuver `maneuver_cost`; §7 leaf/cutoff honored on miss
-> distance). The Pc / chance-constraint reward is Phase 6. `dt` is a swappable
+> **Phase 5 built the mechanics on a miss-distance placeholder reward; Phase 6
+> replaced that reward wholesale** (below). The mechanics (UCB, backup, widening,
+> determinism, tree health) are unchanged and still tested. `dt` is a swappable
 > planner argument (defaults `pomdp.dt`) — both the 1-hr and 30-min grids run
 > end-to-end; no default is forced.
+
+### Phase 6 — Pc-at-TCA reward + per-step chance constraint
+
+Phase 6 replaces the Phase-5 miss-distance reward with a **Pc-at-TCA** reward and
+a **per-step chance-constraint check** (architecture §4 steps 5–6, §7):
+
+- `node_pc_at_tca(pomdp, node)` computes Pc-at-TCA from a node's belief via the
+  Phase-1 Chan method. **Uncertainty model:** a tracking measurement is assumed
+  each decision step, so the belief covariance is re-anchored to `P0` at each
+  node; a node with time-remaining τ therefore uses a **fresh `P0` grown over the
+  remaining τ** (`Σ_at_TCA = Φ(now→TCA)·P0·Φᵀ`, read from Brahe's
+  `covariance_gcrf`) — shorter τ ⇒ less growth ⇒ lower Pc, matching the Phase 3
+  Pc-vs-τ trust curve. The node's belief **mean** is propagated to TCA (that is
+  what a maneuver moves). The Phase 3 Σ(τ) table is *not* reused as a lookup here
+  (it is anchored the other way in time and lands on a different orbital phase —
+  the R/N covariance breathes once per orbit; per-node direct propagation is
+  exact).
+- `step_reward` = `−pc_weight·Pc − maneuver_cost` (per burn) `− pc_penalty` when
+  `Pc > pomdp.pc_threshold`. The constraint is checked on **every** simulated
+  step, at every depth — not once per node.
+- `leaf_value` reuses the *same* Pc-at-TCA for both a true leaf (reached TCA) and
+  a computational-budget cutoff (§7 — one consistent risk metric).
+- `constraint_mode` (planner arg): `:penalize` (default — penalty but keep
+  expanding, so a violate-then-recover wait-and-measure branch is not amputated),
+  `:terminate` (also mark the branch terminal), `:off` (no-constraint baseline).
+  Each `BeliefNode` records its `pc` / `violated` for ablation.
 
 ```bash
 julia --project=. src/tests/test_belief_mcts.jl
 ```
 
-28 checks in 6 groups: **UCB selection** (picks the higher-Q action at c=0, takes
-unvisited actions first, and the exploration bonus flips an under-visited action);
-**backup arithmetic** (the running-mean update equals a straight mean); **progressive
-widening** (the POMCPOW rule and a sublinear child-growth rate); **tree health**
-(every node's belief stays symmetric, PD, and finite); **determinism** (same seed ⇒
-bitwise-identical tree); and **end-to-end** — on a real cross-track conjunction where
-a 5 m/s burn grows the 200 m miss to ~170 km by TCA, the planner prefers MANEUVER.
+45 checks in 10 groups: the five Phase-5 mechanics groups above (**UCB
+selection**, **backup arithmetic**, **progressive widening**, **tree health**,
+**determinism**) plus five Phase-6 groups — **Pc-at-TCA from a node** (finite, in
+[0,1], matches a direct `chan_pc` on the mean-to-TCA + fresh-P0-grown-over-τ);
+**Pc reflects P0-grown-over-τ** (a node hours out has an appreciable Pc, a node at
+TCA is orders of magnitude smaller — the Option-2 signature, noting the
+once-per-orbit ripple); **per-step constraint** (penalty fires above threshold,
+not below; `:off` disables it; `:terminate` marks a violating child terminal);
+**leaf == cutoff** (identical Pc-at-TCA value); and **end-to-end + ablation** — on
+a real cross-track conjunction the planner prefers the maneuver that lowers
+Pc-at-TCA, and `:terminate` prunes more violating nodes than `:penalize`.
 
-Same Brahe-only dependency as the other tests.
+Same Brahe-only dependency as the other tests. Note: Pc evaluation is ~172 ms
+per node (two Brahe numerical propagations), so a `plan` call over a multi-hour
+window takes minutes — the search-efficiency pass (Julia-level threading of the
+per-node propagations) is deferred to a later task.
