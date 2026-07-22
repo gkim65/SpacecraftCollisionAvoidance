@@ -22,11 +22,14 @@ distributed separately) and `CONSTANTS.md` for the sourced parameters.
 | 2 | Conjunction generator (head-on / cross-track) + Pc sanity check | done |
 | 3 | Precomputed Σ(τ) covariance-vs-time-remaining table + Pc-trust check | done |
 | 4 | Kalman predict/correct belief tracker (linear-Gaussian) | done |
-| 5+ | MCTS, chance constraint | not started |
+| 5 | Baseline belief-space MCTS skeleton (miss-distance reward, no Pc yet) | done |
+| 6+ | Chance constraint (Pc reward), baselines, experiments | not started |
 
-Only Phases 0–4 have reproducible results as of this commit. (Proximity-ops
-geometry and the nonlinear SSN observation model are deferred — see
-`notes/TODOS.md`.)
+Only Phases 0–5 have reproducible results as of this commit. Phase 5 is the
+search-mechanics checkpoint: a hand-rolled belief-space MCTS running end-to-end
+on a **miss-distance-only** reward — the chance constraint (Pc) is Phase 6.
+(Proximity-ops geometry and the nonlinear SSN observation model are deferred —
+see `notes/TODOS.md`.)
 
 ## Layout
 
@@ -43,12 +46,14 @@ src/
     computePc.jl                   Pc methods: Chan (1997), Foster, Monte Carlo
     covarianceTable.jl             precomputed Σ(τ) table + Pc-through-Σ(τ) check
     beliefTracker.jl               Kalman predict/correct belief tracker (Phase 4)
+    beliefMCTS.jl                  baseline belief-space MCTS skeleton (Phase 5)
   tests/
     test_chan_crossvalidation.jl   Julia-vs-Python Chan cross-validation
     test_conjunction_generator.jl  conjunction geometry + Pc-vs-miss sanity check
     test_from_orbits.jl            orbit-first closest-approach round-trip verification
     test_covariance_table.jl       Σ(τ) structure/health/growth + Pc-trust check
     test_belief_tracker.jl         Kalman predict/correct: shrinkage, z-independence, x-val
+    test_belief_mcts.jl            MCTS mechanics: UCB, backup, widening, determinism, e2e
 CONSTANTS.md                       every physical constant + its source
 figures/                           generated figures (local; not tracked in git)
 ```
@@ -244,5 +249,73 @@ checks total):
 - **Grid equivalence** — at every shared (whole-hour) τ the 30-min and 1-hr
   tables agree, confirming Σ(τ) is a pure function of time-remaining,
   independent of the step size used to build it.
+
+Same Brahe-only dependency as the other tests.
+
+### Phase 4 — Kalman predict/correct belief tracker
+
+`src/utils/beliefTracker.jl` is the linear-Gaussian belief tracker the planner
+carries through search. A `Belief` is **two independent 6×6 sub-beliefs** (one
+spacecraft, one debris) plus time-remaining `t` — the objects are physically
+independent, so a coupled 12×12 would only carry structural zeros. `predict`
+propagates each `(μ, Σ)` one `dt` step (μ via the `transitions.jl` dynamics with a
++Δv·v̂ kick on the spacecraft if MANEUVER; `Σ⁻ = Φ Σ Φᵀ` via Brahe, no process
+noise — so WAIT and MANEUVER give the same `Σ⁻`, differing only in μ).
+`correct_linear` (the runtime path, H = I₆) and `correct_brahe` (a brahe
+`ExtendedKalmanFilter` cross-validation oracle) both apply the Kalman update
+against a genuine sampled observation from `sample_observation`.
+
+> **Load-bearing property:** in the linear-Gaussian update, `Σ⁺ = (I−KH)Σ⁻`
+> depends only on H and R, **not** on the sampled observation value — only μ⁺
+> depends on z. This is exactly what makes the Phase 3 `Σ(τ)` lookup valid. It
+> holds only for the linear update under noiseless maneuvers (a nonlinear SSN
+> model, deferred to Phase 8.5, would break it).
+
+```bash
+julia --project=. src/tests/test_belief_tracker.jl
+```
+
+99 checks in 5 groups: correction shrinks Σ (`Σ⁻ − Σ⁺ ⪰ 0`); Σ⁺ is bitwise
+identical across 40 random observation draws while μ⁺ varies (the z-independence
+property); predict-then-correct tracks truth within 3σ with Σ staying sym + PD;
+the hand-rolled and brahe filters agree to <1e-10; and predict's `Σ⁻` at τ = dt
+matches the Phase 3 `build_covariance_table` entry to <1e-9.
+
+Same Brahe-only dependency as the other tests.
+
+### Phase 5 — baseline belief-space MCTS skeleton (miss-distance reward)
+
+`src/utils/beliefMCTS.jl` is the hand-rolled belief-space MCTS (architecture doc
+§4/§6) — **not** POMCPOW. A `BeliefNode` carries a Phase-4 `Belief`, the sampled
+true `CAState`, visit/value bookkeeping (`N`, per-action `Na`/`Qa`), and
+observation-children per action. One simulation (`simulate!`) does the §4 loop:
+select an action by **UCB** (`Q + c·√(ln N / n_a)`), expand via
+`POMDPs.transition` (true state) + `predict` + `sample_observation` +
+`correct_linear` (belief), recurse, and back up a running average. Stochastic
+observations are handled by **double progressive widening** — a node adds a new
+observation-child while `n_children ≤ k·n_a^α`, else reuses one at random. The
+UCB/MaxUCB and widening rules and their constants (`c=1`, `k=10`, `α=0.5`,
+`tree_queries=1000`) are **borrowed from POMCPOW's published defaults**; the
+solver itself is not adopted, so the belief stays visible to the reward at every
+step (the whole point of §6).
+
+> **Phase 5 is the mechanics checkpoint.** The reward is **miss-distance-only**
+> (`step_reward`/`leaf_value`: reward larger miss at TCA, large collision
+> penalty, per-maneuver `maneuver_cost`; §7 leaf/cutoff honored on miss
+> distance). The Pc / chance-constraint reward is Phase 6. `dt` is a swappable
+> planner argument (defaults `pomdp.dt`) — both the 1-hr and 30-min grids run
+> end-to-end; no default is forced.
+
+```bash
+julia --project=. src/tests/test_belief_mcts.jl
+```
+
+28 checks in 6 groups: **UCB selection** (picks the higher-Q action at c=0, takes
+unvisited actions first, and the exploration bonus flips an under-visited action);
+**backup arithmetic** (the running-mean update equals a straight mean); **progressive
+widening** (the POMCPOW rule and a sublinear child-growth rate); **tree health**
+(every node's belief stays symmetric, PD, and finite); **determinism** (same seed ⇒
+bitwise-identical tree); and **end-to-end** — on a real cross-track conjunction where
+a 5 m/s burn grows the 200 m miss to ~170 km by TCA, the planner prefers MANEUVER.
 
 Same Brahe-only dependency as the other tests.
