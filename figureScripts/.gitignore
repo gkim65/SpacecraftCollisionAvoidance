@@ -1,0 +1,3 @@
+# Generated intermediate data (Julia → JSON → matplotlib). Regenerable from the
+# committed *.jl scripts; not part of the permanent record, like figures/ output.
+*.json

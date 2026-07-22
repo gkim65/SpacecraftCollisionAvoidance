@@ -21,10 +21,12 @@ distributed separately) and `CONSTANTS.md` for the sourced parameters.
 | 1 | Chan (1997) Pc + cross-validation vs Python reference | done |
 | 2 | Conjunction generator (head-on / cross-track) + Pc sanity check | done |
 | 3 | Precomputed Σ(τ) covariance-vs-time-remaining table + Pc-trust check | done |
-| 4+ | Kalman tracker, MCTS, chance constraint | not started |
+| 4 | Kalman predict/correct belief tracker (linear-Gaussian) | done |
+| 5+ | MCTS, chance constraint | not started |
 
-Only Phases 0–3 have reproducible results as of this commit. (Proximity-ops
-geometry is deferred — see `notes/TODOS.md`.)
+Only Phases 0–4 have reproducible results as of this commit. (Proximity-ops
+geometry and the nonlinear SSN observation model are deferred — see
+`notes/TODOS.md`.)
 
 ## Layout
 
@@ -40,11 +42,13 @@ src/
     genConjunctions.jl             Brahe / PyCall setup, conjunction generation
     computePc.jl                   Pc methods: Chan (1997), Foster, Monte Carlo
     covarianceTable.jl             precomputed Σ(τ) table + Pc-through-Σ(τ) check
+    beliefTracker.jl               Kalman predict/correct belief tracker (Phase 4)
   tests/
     test_chan_crossvalidation.jl   Julia-vs-Python Chan cross-validation
     test_conjunction_generator.jl  conjunction geometry + Pc-vs-miss sanity check
     test_from_orbits.jl            orbit-first closest-approach round-trip verification
     test_covariance_table.jl       Σ(τ) structure/health/growth + Pc-trust check
+    test_belief_tracker.jl         Kalman predict/correct: shrinkage, z-independence, x-val
 CONSTANTS.md                       every physical constant + its source
 figures/                           generated figures (local; not tracked in git)
 ```

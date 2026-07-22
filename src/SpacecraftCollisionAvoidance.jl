@@ -17,6 +17,8 @@ include("rewards.jl")
 include("observations.jl")
 include("transitions.jl")
 
+include("utils/beliefTracker.jl")
+
 # export
 # end
 
