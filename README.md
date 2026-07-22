@@ -62,19 +62,27 @@ julia --project=. -e 'using Pkg; Pkg.instantiate()'
 
 Pc computation and conjunction generation call the Python
 [`brahe`](https://github.com/duncaneddy/brahe) orbital-mechanics library
-through `PyCall`. `PyCall` must point at a Python environment with `brahe`
-(and `numpy`) installed:
+through `PyCall`. The Python side is a dedicated, reproducible in-repo
+environment managed with [`uv`](https://docs.astral.sh/uv/): `pyproject.toml`
+and `uv.lock` (both committed) pin `brahe==1.7.0` and a compatible `numpy` — the
+only two packages the Julia code imports via `PyCall`. Build it with:
 
 ```bash
-# confirm PyCall can import brahe
-julia --project=. -e 'using PyCall; pyimport("brahe"); println("brahe OK")'
+uv sync            # creates ./.venv from pyproject.toml + uv.lock
 ```
 
-If `brahe` is not found, rebuild `PyCall` against the correct Python:
+Then point `PyCall` at that in-repo `.venv` and rebuild it:
 
 ```bash
-PYTHON=/path/to/python-with-brahe julia --project=. -e 'using Pkg; Pkg.build("PyCall")'
+PYTHON="$PWD/.venv/bin/python" julia --project=. -e 'using Pkg; Pkg.build("PyCall")'
+
+# confirm PyCall imports brahe 1.7.0 from the in-repo venv
+julia --project=. -e 'using PyCall; println(pyimport("brahe").__version__)'   # => 1.7.0
 ```
+
+The `.venv/` directory is git-ignored; `uv sync` rebuilds it identically from
+the committed lockfile, so anyone cloning the repo reproduces the exact Python
+environment.
 
 ## Reproducing results
 
@@ -110,9 +118,12 @@ this test requires:
   `../ProbofCollision/.venv/` containing `numpy` and the `collision` package.
   (Override the interpreter path in `src/tests/chan_reference.py` /
   `test_chan_crossvalidation.jl`, or the `PROBOFCOLLISION_SRC` env var, if your
-  layout differs.)
-- `PyCall` able to import `brahe` (see Setup) for the orientation group; that
-  group is skipped with a warning if Brahe is unavailable.
+  layout differs.) **This is a separate interpreter from the PyCall/brahe
+  binding** — it is the Python Chan *reference*, invoked as a subprocess, and
+  stays pointed at `ProbofCollision`; it is not the in-repo `.venv`.
+- `PyCall` able to import `brahe` from the in-repo `.venv` (see Setup) for the
+  orientation group; that group is skipped with a warning if Brahe is
+  unavailable.
 
 ### Phase 2 — conjunction generator sanity check
 

@@ -1,0 +1,14 @@
+[project]
+name = "spacecraft-collision-avoidance"
+version = "0.1.0"
+description = "Python (brahe) side of the chance-constrained belief-space MCTS planner, imported by the Julia code through PyCall."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "brahe==1.7.0",
+    "numpy>=2.0,<3.0",
+]
+
+[tool.uv]
+# brahe and numpy are the only packages the Julia code imports via PyCall
+# (pyimport("brahe"), pyimport("numpy")). Keep this environment minimal so
+# PyCall has a small, reproducible target.

@@ -1,5 +1,7 @@
 *.png
 src/.DS_Store
+.venv/
+__pycache__/
 CLAUDE.md
 notes/*
 CONSTANTS.md
