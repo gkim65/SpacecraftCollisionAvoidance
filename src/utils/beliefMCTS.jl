@@ -132,16 +132,24 @@ mutable struct BeliefNode
     Qa::Dict{CAAction,Float64}     # per-action running-average value
     children::Dict{CAAction,Vector{BeliefNode}}   # obs-children per action
     is_terminal::Bool
+    # --- asymmetric measurement cadence (TODOS "measurement realism") ---------
+    # Seconds elapsed since each object last got a correction. A child expanded
+    # from this node predicts one dt step, adding dt to each timer; when a timer
+    # crosses the object's cadence a correction fires (shrinks Σ) and the timer
+    # resets. sat (GPS) and debris (TLE) run on independent schedules.
+    since_sc::Float64
+    since_debris::Float64
     # --- Phase 6 Pc instrumentation (for the constraint + the ablation) -------
     pc::Float64                    # Pc-at-TCA from this node's belief (NaN = not yet computed)
     violated::Bool                 # did this node's Pc exceed pomdp.pc_threshold?
 end
 
-function BeliefNode(belief::Belief, s_true::CAState, is_terminal::Bool)
+function BeliefNode(belief::Belief, s_true::CAState, is_terminal::Bool;
+                    since_sc::Real = 0.0, since_debris::Real = 0.0)
     return BeliefNode(belief, s_true, 0,
                       Dict{CAAction,Int}(), Dict{CAAction,Float64}(),
                       Dict{CAAction,Vector{BeliefNode}}(), is_terminal,
-                      NaN, false)
+                      Float64(since_sc), Float64(since_debris), NaN, false)
 end
 
 # =========================================================================
@@ -355,36 +363,65 @@ should_widen(n_children::Int, na::Int; k::Real = MCTS_K_OBS, α::Real = MCTS_ALP
 # =========================================================================
 
 """
-    expand_child(pomdp, node, a, rng; dt=pomdp.dt,
+    expand_child(pomdp, node, a, rng; dt=pomdp.dt, cadence_sc=..., cadence_debris=...,
                  constraint_mode=MCTS_CONSTRAINT_MODE, pc_weight=..., pc_penalty=...)
         -> (child::BeliefNode, r::Float64)
 
 Take action `a` from `node`: propagate the sampled true state (Phase 0
-`POMDPs.transition`), predict the belief (Phase 4 `predict`), sample a genuine
-observation of the new true state (`sample_observation`), and correct the belief
-(`correct_linear`, the runtime path). Then evaluate the Pc-based step reward +
-per-step chance constraint on the child (architecture §4 steps 5–6): the child's
-Pc-at-TCA and violation flag are cached on it. Under `constraint_mode ==
-:terminate`, a violating child is additionally marked terminal so the search
-stops expanding past it. Returns the new observation-child node and its step
-reward. `dt` is swappable (defaults pomdp.dt).
+`POMDPs.transition`), predict the belief (Phase 4 `predict`), then apply the
+ASYMMETRIC measurement cadence (TODOS "measurement realism"). The satellite is an
+own-asset GPS fix (~10 m, every `cadence_sc` ≈ 2 h) and the debris is an SSN/TLE
+fix (~1 km, every `cadence_debris` ≈ 8 h) — so on any one dt step we correct the
+satellite, the debris, both, or NEITHER, depending on how much time has elapsed
+since each object was last fixed. Between fixes an object is predict-only and its
+Σ GROWS (no measurement). A correction fires for an object when its elapsed-time
+timer (parent's `since_*` + this step's dt) reaches its cadence, at which point
+the timer resets; otherwise it carries forward. Only the object(s) actually being
+measured are corrected (`correct_linear_sc` / `correct_linear_debris`), each
+against a freshly sampled observation of the true state.
+
+Then evaluate the Pc-based step reward + per-step chance constraint on the child
+(architecture §4 steps 5–6): the child's Pc-at-TCA and violation flag are cached
+on it. Under `constraint_mode == :terminate`, a violating child is additionally
+marked terminal so the search stops expanding past it. Returns the new
+observation-child node and its step reward. `dt` and both cadences are swappable
+(default to the POMDP values).
 """
 function expand_child(pomdp::SpacecraftCAPOMDP, node::BeliefNode, a::CAAction,
                       rng::AbstractRNG; dt::Real = pomdp.dt,
+                      cadence_sc::Real = pomdp.cadence_sc,
+                      cadence_debris::Real = pomdp.cadence_debris,
                       constraint_mode::Symbol = MCTS_CONSTRAINT_MODE,
                       pc_weight::Real = MCTS_PC_REWARD_WEIGHT,
                       pc_penalty::Real = MCTS_PC_VIOLATION_PENALTY)
     # 1. propagate the sampled true state (Phase 0 dynamics)
     sp = rand(rng, POMDPs.transition(pomdp, node.s_true, a))
 
-    # 2. predict the belief forward one dt step (Phase 4)
-    b_pred = predict(pomdp, node.belief, a; dt = dt)
+    # 2. predict the belief forward one dt step (Phase 4). Σ GROWS this step.
+    b = predict(pomdp, node.belief, a; dt = dt)
 
-    # 3–4. sample a real observation of sp, then correct (runtime path)
-    z = sample_observation(pomdp, a, sp, rng)
-    b_post = correct_linear(pomdp, b_pred, z)
+    # 3–4. asymmetric cadence: correct only the object(s) whose fix is due.
+    # A fix is due for an object when the time since its last fix has reached its
+    # cadence. Timers carry the parent's elapsed time forward by one dt step.
+    since_sc     = node.since_sc     + Float64(dt)
+    since_debris = node.since_debris + Float64(dt)
+    correct_sc     = since_sc     >= cadence_sc
+    correct_debris = since_debris >= cadence_debris
 
-    child = BeliefNode(b_post, sp, isterminal(pomdp, sp))
+    if correct_sc || correct_debris
+        z = sample_observation(pomdp, a, sp, rng)   # one genuine draw of the true state
+        if correct_sc
+            b = correct_linear_sc(pomdp, b, z)
+            since_sc = 0.0                           # fix taken → reset the timer
+        end
+        if correct_debris
+            b = correct_linear_debris(pomdp, b, z)
+            since_debris = 0.0
+        end
+    end
+
+    child = BeliefNode(b, sp, isterminal(pomdp, sp);
+                       since_sc = since_sc, since_debris = since_debris)
 
     # 5–6. Pc-at-TCA + per-step chance constraint (§4 step 6). Caches pc/violated.
     r, _, violated = step_reward(pomdp, a, child;
@@ -450,6 +487,8 @@ depth==0 cutoff return the Pc-at-TCA `leaf_value` (§7). The `constraint_mode`,
 """
 function simulate!(pomdp::SpacecraftCAPOMDP, node::BeliefNode, depth::Int,
                    rng::AbstractRNG; dt::Real = pomdp.dt,
+                   cadence_sc::Real = pomdp.cadence_sc,
+                   cadence_debris::Real = pomdp.cadence_debris,
                    c::Real = MCTS_UCB_C, k::Real = MCTS_K_OBS, α::Real = MCTS_ALPHA_OBS,
                    constraint_mode::Symbol = MCTS_CONSTRAINT_MODE,
                    pc_weight::Real = MCTS_PC_REWARD_WEIGHT,
@@ -471,6 +510,7 @@ function simulate!(pomdp::SpacecraftCAPOMDP, node::BeliefNode, depth::Int,
     local r::Float64
     if should_widen(length(kids), na; k = k, α = α)
         child, r = expand_child(pomdp, node, a, rng; dt = dt,
+                                cadence_sc = cadence_sc, cadence_debris = cadence_debris,
                                 constraint_mode = constraint_mode,
                                 pc_weight = pc_weight, pc_penalty = pc_penalty)
         push!(kids, child)
@@ -484,7 +524,9 @@ function simulate!(pomdp::SpacecraftCAPOMDP, node::BeliefNode, depth::Int,
     end
 
     q = r + POMDPs.discount(pomdp) * simulate!(pomdp, child, depth - 1, rng;
-                                               dt = dt, c = c, k = k, α = α,
+                                               dt = dt, cadence_sc = cadence_sc,
+                                               cadence_debris = cadence_debris,
+                                               c = c, k = k, α = α,
                                                constraint_mode = constraint_mode,
                                                pc_weight = pc_weight, pc_penalty = pc_penalty)
 
@@ -504,7 +546,10 @@ end
                 constraint_mode, pc_weight, pc_penalty)
 
 Configuration for the Phase-6 chance-constrained belief-space MCTS planner. `dt`
-defaults to `pomdp.dt` and is swappable (run both grids to compare). The search
+defaults to `pomdp.dt` and is swappable (run both grids to compare). The
+measurement cadences `cadence_sc` (~2 h GPS) / `cadence_debris` (~8 h TLE) are
+also swappable (default to the POMDP values) and drive the asymmetric per-object
+correction schedule in `expand_child` (TODOS "measurement realism"). The search
 knobs (`c`, `k`, `α`, `n_iterations`, `max_depth`) and the Pc-reward knobs
 (`pc_weight`, `pc_penalty`) default to the CONSTANTS.md values. `constraint_mode`
 (`:penalize` | `:terminate` | `:off`) selects how a per-step Pc violation is
@@ -518,6 +563,8 @@ struct MCTSPlanner
     k::Float64
     α::Float64
     dt::Float64
+    cadence_sc::Float64
+    cadence_debris::Float64
     constraint_mode::Symbol
     pc_weight::Float64
     pc_penalty::Float64
@@ -530,11 +577,14 @@ function MCTSPlanner(pomdp::SpacecraftCAPOMDP;
                      k::Real = MCTS_K_OBS,
                      α::Real = MCTS_ALPHA_OBS,
                      dt::Real = pomdp.dt,
+                     cadence_sc::Real = pomdp.cadence_sc,
+                     cadence_debris::Real = pomdp.cadence_debris,
                      constraint_mode::Symbol = MCTS_CONSTRAINT_MODE,
                      pc_weight::Real = MCTS_PC_REWARD_WEIGHT,
                      pc_penalty::Real = MCTS_PC_VIOLATION_PENALTY)
     return MCTSPlanner(pomdp, n_iterations, max_depth, Float64(c),
                        Float64(k), Float64(α), Float64(dt),
+                       Float64(cadence_sc), Float64(cadence_debris),
                        constraint_mode, Float64(pc_weight), Float64(pc_penalty))
 end
 
@@ -549,7 +599,9 @@ inspection/testing.
 function plan(planner::MCTSPlanner, root::BeliefNode, rng::AbstractRNG)
     for _ in 1:planner.n_iterations
         simulate!(planner.pomdp, root, planner.max_depth, rng;
-                  dt = planner.dt, c = planner.c, k = planner.k, α = planner.α,
+                  dt = planner.dt, cadence_sc = planner.cadence_sc,
+                  cadence_debris = planner.cadence_debris,
+                  c = planner.c, k = planner.k, α = planner.α,
                   constraint_mode = planner.constraint_mode,
                   pc_weight = planner.pc_weight, pc_penalty = planner.pc_penalty)
     end
@@ -567,13 +619,27 @@ function plan(planner::MCTSPlanner, root::BeliefNode, rng::AbstractRNG)
 end
 
 """
-    root_from_pomdp(pomdp, s0::CAState) -> BeliefNode
+    root_from_pomdp(pomdp, s0::CAState; correct_at_root=pomdp.correct_at_root) -> BeliefNode
 
 Build a root node whose belief is anchored at the true state `s0` with the
 POMDP's P0 covariances (Phase 4 `belief_from_pomdp`) and whose sampled true
 state is `s0` itself. `t` (time-remaining) comes from `s0.t`.
+
+The cadence timers (`since_sc` / `since_debris`) are initialized per
+`correct_at_root`:
+  • `true`  — both objects were just fixed at detection (P0 IS that fix), so the
+    timers start at 0 and the first in-tree correction for each object fires one
+    full cadence later. (Default.)
+  • `false` — timers start pre-loaded at each object's cadence, so a fix can land
+    on the very first step (a fix that arrives soon after detection). A phase
+    parameter for whether the debris TLE / GPS fix is "fresh" or "stale" at the
+    root; swappable so we can test the effect (TODOS "measurement realism").
 """
-function root_from_pomdp(pomdp::SpacecraftCAPOMDP, s0::CAState)
+function root_from_pomdp(pomdp::SpacecraftCAPOMDP, s0::CAState;
+                         correct_at_root::Bool = pomdp.correct_at_root)
     b0 = belief_from_pomdp(pomdp, s0.sc_eci, s0.debris_eci, s0.t)
-    return BeliefNode(b0, s0, isterminal(pomdp, s0))
+    since_sc     = correct_at_root ? 0.0 : pomdp.cadence_sc
+    since_debris = correct_at_root ? 0.0 : pomdp.cadence_debris
+    return BeliefNode(b0, s0, isterminal(pomdp, s0);
+                      since_sc = since_sc, since_debris = since_debris)
 end

@@ -401,4 +401,95 @@ end
         @test nterm_term >= nterm_pen
     end
 
+    # -----------------------------------------------------------------
+    @testset "11. Asymmetric measurement cadence (predict-only vs. fix steps)" begin
+        # The satellite (GPS, ~2 h) and debris (TLE, ~8 h) get corrected on
+        # DIFFERENT schedules. Between an object's fixes it is predict-only and
+        # its Σ GROWS; on a fix step its Σ SHRINKS. With dt = 1 h, cadence_sc = 2 h,
+        # cadence_debris = 8 h and correct_at_root = true (timers start at 0):
+        #   step 1 (elapsed 1 h): neither due   → both predict-only (Σ grows)
+        #   step 2 (elapsed 2 h): sat due        → sat shrinks, debris still grows
+        #   ... debris first due at step 8 (elapsed 8 h).
+        pomdp = SpacecraftCAPOMDP(seed = 42, randAdd = false, dt = 60 * 60,
+                                  TCA_max = 10 * 60 * 60,
+                                  cadence_sc = 2 * 60 * 60, cadence_debris = 8 * 60 * 60,
+                                  correct_at_root = true)
+        s0 = make_conjunction_state(pomdp; miss_m = 500.0, v_rel = 15.0,
+                                    geometry = :cross_track, t = 10 * 60 * 60)
+        root = root_from_pomdp(pomdp, s0)
+        @test root.since_sc == 0.0 && root.since_debris == 0.0
+
+        Σsc0 = root.belief.sc.Σ[1, 1]
+        Σdb0 = root.belief.debris.Σ[1, 1]
+
+        # --- Step 1: neither cadence reached (elapsed 1 h) ⇒ predict-only. ------
+        c1, _ = expand_child(pomdp, root, WAIT, MersenneTwister(0); dt = pomdp.dt)
+        @test c1.since_sc == 60.0 * 60 && c1.since_debris == 60.0 * 60   # timers advanced
+        @test c1.belief.sc.Σ[1, 1]     > Σsc0    # SC Σ grew (no fix)
+        @test c1.belief.debris.Σ[1, 1] > Σdb0    # debris Σ grew (no fix; first step is growth)
+
+        # --- Step 2 from c1: sat cadence reached (elapsed 2 h), debris not. -----
+        c2, _ = expand_child(pomdp, c1, WAIT, MersenneTwister(0); dt = pomdp.dt)
+        @test c2.since_sc == 0.0                       # sat fix taken → timer reset
+        @test c2.since_debris == 2 * 60.0 * 60         # debris still waiting (no fix, timer carried)
+        @test c2.belief.sc.Σ[1, 1]     < c1.belief.sc.Σ[1, 1]      # SC Σ SHRANK (fix)
+        # NB: we deliberately do NOT assert the debris Σ "grew" on this predict-only
+        # step. Only the ALONG-TRACK axis grows monotonically (secular drift); the
+        # two minor RADIAL/CROSS-TRACK axes are bounded CW modes that BREATHE once
+        # per orbit, so their trace can dip on a given step even with no measurement
+        # (verified numerically 2026-07-23). The timer-not-reset check above is the
+        # thing that proves the debris got no fix. CAVEAT: the per-step SHRINK itself
+        # is not yet independently trusted — it wants the window-Pc / finer-grid
+        # verification (experiment_ideas #1) before any logic relies on it; here we
+        # only rely on it NOT holding a monotone-growth assertion.
+
+        # --- Walk out to the step where the debris fix is due (step 8, 8 h). ---
+        # NB: at σ_debris = 1 km the measurement is WEAK (R = 1e6 ≫ Σ⁻), and 8 h
+        # of growth is large, so the TLE fix need NOT pull Σ below its prior value
+        # — it only shrinks Σ RELATIVE TO THAT STEP'S PREDICT. That weak-fix regime
+        # is exactly the intended physics (debris is the dominant, growing
+        # uncertainty). So the correct check compares the fix step against a
+        # predict-only counterpart from the SAME parent over the SAME step: the
+        # correction is Σ⁺ = (I−K)Σ⁻ ⪯ Σ⁻, so a fix step's Σ < a predict-only step's.
+        node = root
+        for step in 1:7                       # advance to the node just before the debris fix
+            node, _ = expand_child(pomdp, node, WAIT, MersenneTwister(step); dt = pomdp.dt)
+        end
+        @test node.since_debris == 7 * 60.0 * 60      # debris not yet fixed (due next step)
+        # step 8 WITH the debris fix (cadence 8 h reached this step)
+        fix, _ = expand_child(pomdp, node, WAIT, MersenneTwister(8); dt = pomdp.dt)
+        @test fix.since_debris == 0.0                 # debris fixed at step 8
+        # step 8 WITHOUT a debris fix (same parent, debris cadence pushed out of reach)
+        pomdp_nodfix = SpacecraftCAPOMDP(seed = 42, randAdd = false, dt = 60 * 60,
+                                         TCA_max = 10 * 60 * 60,
+                                         cadence_sc = 2 * 60 * 60,
+                                         cadence_debris = 100 * 60 * 60,  # never fires here
+                                         correct_at_root = true)
+        predonly, _ = expand_child(pomdp_nodfix, node, WAIT, MersenneTwister(8); dt = pomdp.dt)
+        @test predonly.since_debris > 0.0             # debris NOT fixed (predict-only)
+        @test fix.belief.debris.Σ[1, 1] < predonly.belief.debris.Σ[1, 1]  # the fix shrank Σ this step
+
+        # --- correct_at_root = false: a fix lands on the very first step. -------
+        # Same weak-fix caveat, so again compare fix vs. predict-only at step 1.
+        pomdp_stale = SpacecraftCAPOMDP(seed = 42, randAdd = false, dt = 60 * 60,
+                                        TCA_max = 10 * 60 * 60,
+                                        cadence_sc = 2 * 60 * 60, cadence_debris = 8 * 60 * 60,
+                                        correct_at_root = false)
+        root_stale = root_from_pomdp(pomdp_stale, s0)
+        @test root_stale.since_sc == pomdp_stale.cadence_sc
+        @test root_stale.since_debris == pomdp_stale.cadence_debris
+        cs, _ = expand_child(pomdp_stale, root_stale, WAIT, MersenneTwister(0); dt = pomdp_stale.dt)
+        @test cs.since_sc == 0.0 && cs.since_debris == 0.0          # both fixed on step 1
+        # predict-only counterpart: timers start at 0 (correct_at_root = true) and
+        # cadences pushed out of reach, so no fix fires on step 1.
+        pomdp_nofix = SpacecraftCAPOMDP(seed = 42, randAdd = false, dt = 60 * 60,
+                                        TCA_max = 10 * 60 * 60,
+                                        cadence_sc = 100 * 60 * 60, cadence_debris = 100 * 60 * 60,
+                                        correct_at_root = true)
+        root_nofix = root_from_pomdp(pomdp_nofix, s0)
+        cn, _ = expand_child(pomdp_nofix, root_nofix, WAIT, MersenneTwister(0); dt = pomdp_nofix.dt)
+        @test cn.since_debris > 0.0                                 # confirm NO debris fix
+        @test cs.belief.debris.Σ[1, 1] < cn.belief.debris.Σ[1, 1]   # fix shrank Σ vs. predict-only
+    end
+
 end

@@ -43,7 +43,10 @@ struct SpacecraftCAPOMDP <: POMDP{CAState, CAAction, Vector{Float64}}  # POMDP{S
     R_hard_body_debris::Float64  # debris hard body radius (m), default 15.0
     pc_threshold::Float64 # TODO: not working right now
     dt::Float64  # timestep in seconds, default 30 minutes
-    γ::Float64 
+    cadence_sc::Float64      # satellite measurement cadence (s) — onboard GPS, ~2 h
+    cadence_debris::Float64  # debris measurement cadence (s) — SSN/TLE, ~8 h
+    correct_at_root::Bool    # fix both objects at detection (root); timers start there
+    γ::Float64
 end
 
 
@@ -68,14 +71,19 @@ function SpacecraftCAPOMDP(;
     Δv = 0.1, # m/s
     maneuver_cost = 10 , # CHANGE TODO
     P0_sc = diagm([100.0, 100.0, 100.0, 0.0001, 0.0001, 0.0001]),      # 10m, 0.01 m/s TODO
-    P0_debris = diagm([2500.0, 2500.0, 2500.0, 0.01, 0.01, 0.01]),  # 50m, 0.1 m/s,
-    # P0_debris = diagm([10000.0, 10000.0, 10000.0, 0.01, 0.01, 0.01]),   # 100m, 0.1 m/s TODO
-    σ_sc = 10.0, # TODO
-    σ_debris = 100.0, # TODO
+    P0_debris = diagm([1e6, 1e6, 1e6, 0.01, 0.01, 0.01]),  # 1 km pos, 0.1 m/s vel (TLE-sourced; see CONSTANTS.md)
+    # initial debris belief COMES FROM a TLE, so it can be no tighter than σ_debris (1 km).
+    # pos 1σ = 1 km (Flohrer 2008 / ESA SDC5, isotropic mid-band); vel 1σ = 0.1 m/s
+    # (conservative — SGP4-OD near-epoch radial vel error is ~1-3 cm/s, growing over days).
+    σ_sc = 10.0, # own-asset onboard GPS ~1-10 m (Hauschild & Montenbruck 2021); 10 m conservative
+    σ_debris = 1000.0, # SSN/TLE ~1 km at OD epoch (Flohrer 2008 / ESA SDC5)
     R_hard_body_sc = 5.0,  # meters, typical spacecraft radius TODO
     R_hard_body_debris = 15.0,  # meters, typical debris radius TODO
     pc_threshold = 1e-5, # Similar to spacex TODO
     dt = 30*60,  # 30 minute steps
+    cadence_sc = 2*60*60,      # 2 h — GPS operator-contact cadence (swappable; ablation)
+    cadence_debris = 8*60*60,  # 8 h — representative TLE refresh cadence (swappable)
+    correct_at_root = true,    # fix both objects at detection; cadence timers start at root
     γ = 0.99
 
 )
@@ -93,7 +101,8 @@ function SpacecraftCAPOMDP(;
                             R_alt,e,i,Ω,ω,M,seed,randAdd,
                             conjunctionType,rMag,vMag,
                             TCA_max, Δv,maneuver_cost, 
-                            P0_sc, P0_debris,σ_sc, σ_debris,R_hard_body_sc, R_hard_body_debris, pc_threshold, dt, γ)
+                            P0_sc, P0_debris,σ_sc, σ_debris,R_hard_body_sc, R_hard_body_debris, pc_threshold, dt,
+                            cadence_sc, cadence_debris, correct_at_root, γ)
 end
 
 POMDPs.discount(pomdp::SpacecraftCAPOMDP) = pomdp.γ

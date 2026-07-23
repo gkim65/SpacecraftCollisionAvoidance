@@ -26,12 +26,15 @@ distributed separately) and `CONSTANTS.md` for the sourced parameters.
 | 6 | Chance constraint: Pc-at-TCA reward + per-step constraint check | done |
 | 7+ | Closed-loop episode driver, baselines, experiments | not started |
 
-Only Phases 0–6 have reproducible results as of this commit. Phase 6 replaces
-the Phase-5 miss-distance placeholder with a **Pc-at-TCA reward** and a **per-step
-chance-constraint check** (Pc evaluated from each node's belief at every simulated
-step, penalized when Pc > threshold). The uncertainty model assumes a tracking
-measurement each decision step, so a node's Pc uses a fresh initial covariance
-grown over the *remaining* time to TCA. (The outer closed-loop episode driver,
+Only Phases 0–6 (plus the measurement-realism pass) have reproducible results as
+of this commit. Phase 6 replaces the Phase-5 miss-distance placeholder with a
+**Pc-at-TCA reward** and a **per-step chance-constraint check** (Pc evaluated from
+each node's belief at every simulated step, penalized when Pc > threshold). A
+node's Pc uses that node's **own accumulated belief covariance** — the Σ the
+Kalman predict/correct cycle produced getting there — propagated the rest of the
+way to TCA. The observation model is **asymmetric**: the satellite gets a ~10 m
+GPS fix about every 2 h and the debris a ~1 km TLE fix about every 8 h, with the
+belief predicted (Σ growing) between fixes. (The outer closed-loop episode driver,
 proximity-ops geometry, and the nonlinear SSN observation model are deferred —
 see `notes/TODOS.md`.)
 
@@ -294,8 +297,11 @@ Same Brahe-only dependency as the other tests.
 true `CAState`, visit/value bookkeeping (`N`, per-action `Na`/`Qa`), and
 observation-children per action. One simulation (`simulate!`) does the §4 loop:
 select an action by **UCB** (`Q + c·√(ln N / n_a)`), expand via
-`POMDPs.transition` (true state) + `predict` + `sample_observation` +
-`correct_linear` (belief), recurse, and back up a running average. Stochastic
+`POMDPs.transition` (true state) + `predict` + (on a measurement step)
+`sample_observation` + `correct_linear_*` (belief), recurse, and back up a
+running average. Corrections follow an **asymmetric measurement cadence** (below,
+Phase "measurement realism"): the belief is *predicted* every step but only
+*corrected* for an object when that object's fix is due. Stochastic
 observations are handled by **double progressive widening** — a node adds a new
 observation-child while `n_children ≤ k·n_a^α`, else reuses one at random. The
 UCB/MaxUCB and widening rules and their constants (`c=1`, `k=10`, `α=0.5`,
@@ -315,16 +321,16 @@ Phase 6 replaces the Phase-5 miss-distance reward with a **Pc-at-TCA** reward an
 a **per-step chance-constraint check** (architecture §4 steps 5–6, §7):
 
 - `node_pc_at_tca(pomdp, node)` computes Pc-at-TCA from a node's belief via the
-  Phase-1 Chan method. **Uncertainty model:** a tracking measurement is assumed
-  each decision step, so the belief covariance is re-anchored to `P0` at each
-  node; a node with time-remaining τ therefore uses a **fresh `P0` grown over the
-  remaining τ** (`Σ_at_TCA = Φ(now→TCA)·P0·Φᵀ`, read from Brahe's
-  `covariance_gcrf`) — shorter τ ⇒ less growth ⇒ lower Pc, matching the Phase 3
-  Pc-vs-τ trust curve. The node's belief **mean** is propagated to TCA (that is
-  what a maneuver moves). The Phase 3 Σ(τ) table is *not* reused as a lookup here
-  (it is anchored the other way in time and lands on a different orbital phase —
-  the R/N covariance breathes once per orbit; per-node direct propagation is
-  exact).
+  Phase-1 Chan method. **Uncertainty model:** a node's Pc uses that node's OWN
+  **accumulated belief Σ** — the covariance the Kalman predict/correct cycle
+  actually produced getting to the node (predict-grown, measurement-shrunk) —
+  propagated the rest of the way to TCA (`Σ_at_TCA = Φ(now→TCA)·Σ_belief·Φᵀ`, read
+  from Brahe's `covariance_gcrf`). This is "Pc at TCA if we stop measuring now and
+  coast" — the covariance the planner actually holds, not a fresh `P0`. The node's
+  belief **mean** is propagated to TCA (that is what a maneuver moves). The Phase 3
+  Σ(τ) table is *not* reused as a lookup here (it is anchored the other way in time
+  and lands on a different orbital phase — the R/N covariance breathes once per
+  orbit; per-node direct propagation is exact).
 - `step_reward` = `−pc_weight·Pc − maneuver_cost` (per burn) `− pc_penalty` when
   `Pc > pomdp.pc_threshold`. The constraint is checked on **every** simulated
   step, at every depth — not once per node.
@@ -339,19 +345,45 @@ a **per-step chance-constraint check** (architecture §4 steps 5–6, §7):
 julia --project=. src/tests/test_belief_mcts.jl
 ```
 
-45 checks in 10 groups: the five Phase-5 mechanics groups above (**UCB
+64 checks in 11 groups: the five Phase-5 mechanics groups above (**UCB
 selection**, **backup arithmetic**, **progressive widening**, **tree health**,
-**determinism**) plus five Phase-6 groups — **Pc-at-TCA from a node** (finite, in
-[0,1], matches a direct `chan_pc` on the mean-to-TCA + fresh-P0-grown-over-τ);
-**Pc reflects P0-grown-over-τ** (a node hours out has an appreciable Pc, a node at
-TCA is orders of magnitude smaller — the Option-2 signature, noting the
-once-per-orbit ripple); **per-step constraint** (penalty fires above threshold,
-not below; `:off` disables it; `:terminate` marks a violating child terminal);
-**leaf == cutoff** (identical Pc-at-TCA value); and **end-to-end + ablation** — on
-a real cross-track conjunction the planner prefers the maneuver that lowers
-Pc-at-TCA, and `:terminate` prunes more violating nodes than `:penalize`.
+**determinism**); five Phase-6 groups — **Pc-at-TCA from a node** (finite, in
+[0,1], matches a direct `chan_pc` on the mean + the node's accumulated Σ propagated
+to TCA, and diverges from a fresh-P0 at a deep node); **Pc grows the belief Σ over
+the coast** (a node hours out has an appreciable Pc, a node at TCA is orders of
+magnitude smaller, noting the once-per-orbit ripple); **per-step constraint**
+(penalty fires above threshold, not below; `:off` disables it; `:terminate` marks
+a violating child terminal); **leaf == cutoff** (identical Pc-at-TCA value);
+**end-to-end + ablation** — on a real cross-track conjunction the planner prefers
+the maneuver that lowers Pc-at-TCA, and `:terminate` prunes more violating nodes
+than `:penalize`; and the **asymmetric measurement cadence** group (below).
 
 Same Brahe-only dependency as the other tests. Note: Pc evaluation is ~172 ms
 per node (two Brahe numerical propagations), so a `plan` call over a multi-hour
 window takes minutes — the search-efficiency pass (Julia-level threading of the
 per-node propagations) is deferred to a later task.
+
+### Asymmetric measurement realism — sourced noise + per-object cadence
+
+The observation model is strongly **asymmetric**, matching operational reality:
+the satellite is an own-asset **GPS** fix (`σ_sc = 10 m`, a conservative bound;
+Hauschild & Montenbruck 2021) corrected about every **2 h**, while the debris is
+an SSN **TLE** (`σ_debris = 1 km` at the OD epoch; Flohrer 2008 / ESA SDC5)
+corrected only about every **8 h**. Both are noisy full-state observations
+(linear `H = I` — a TLE and a GPS solution are each a fitted state estimate, so
+this is faithful, not a shortcut; EKF/UKF are deferred, see the design doc).
+
+The MCTS applies the cadence in `expand_child`: the belief is **predicted every
+step** (Σ grows), but an object is **corrected only when its fix is due**. Each
+`BeliefNode` carries `since_sc` / `since_debris` (seconds since that object's last
+fix); a correction (`correct_linear_sc` / `correct_linear_debris`) fires for an
+object once its timer crosses the object's cadence, then resets. Between TLEs the
+debris covariance grows freely — over an 8 h coast the debris position 1σ ramps
+from ~50 m to ~5 km before the next TLE snaps it back — making the debris the
+dominant, evolving uncertainty. `cadence_sc`, `cadence_debris`, and the
+`correct_at_root` phase toggle are all swappable planner/POMDP arguments (like
+`dt`), ready for the cadence and σ-magnitude ablations. Test group 11 checks that
+a predict-only step advances the timers, a fix step resets the timer and shrinks
+that object's Σ relative to the same step's predict-only counterpart (at
+`σ_debris = 1 km` a single TLE fix is weak, so it need not pull Σ below its prior
+value), and the `correct_at_root` phase behavior.

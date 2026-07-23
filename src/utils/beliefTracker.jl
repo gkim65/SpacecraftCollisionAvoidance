@@ -247,6 +247,32 @@ function correct_linear(pomdp::SpacecraftCAPOMDP, b::Belief, z::AbstractVector;
 end
 
 """
+    correct_linear_sc(pomdp, b⁻::Belief, z; sc_range=1:6) -> Belief
+    correct_linear_debris(pomdp, b⁻::Belief, z; debris_range=7:12) -> Belief
+
+Correct ONE object only, leaving the other sub-belief untouched. Used by the
+MCTS asymmetric measurement cadence (architecture §4 / TODOS "measurement
+realism"): the satellite (own-asset GPS) and debris (SSN/TLE) get fixes on
+DIFFERENT schedules, so a given decision step may correct one, both, or neither
+object. `z` is the full 12-vector observation (only the relevant block is read).
+`t` is unchanged (a correction does not advance time). Equivalent to
+`correct_linear` restricted to a single object.
+"""
+function correct_linear_sc(pomdp::SpacecraftCAPOMDP, b::Belief, z::AbstractVector;
+                           sc_range = 1:6)
+    R_sc = Matrix{Float64}(pomdp.σ_sc^2 * I, 6, 6)
+    μ_sc, Σ_sc = _kalman_correct_linear(b.sc.μ, b.sc.Σ, z[sc_range], R_sc)
+    return Belief(ObjBelief(μ_sc, Σ_sc), b.debris, b.t)
+end
+
+function correct_linear_debris(pomdp::SpacecraftCAPOMDP, b::Belief, z::AbstractVector;
+                               debris_range = 7:12)
+    R_db = Matrix{Float64}(pomdp.σ_debris^2 * I, 6, 6)
+    μ_db, Σ_db = _kalman_correct_linear(b.debris.μ, b.debris.Σ, z[debris_range], R_db)
+    return Belief(b.sc, ObjBelief(μ_db, Σ_db), b.t)
+end
+
+"""
     _kalman_correct_brahe(pomdp, μ⁻, Σ⁻, z, σ, objParams, t) -> (μ⁺, Σ⁺)
 
 Correct one object via brahe 1.7.0's ExtendedKalmanFilter with the LINEAR
