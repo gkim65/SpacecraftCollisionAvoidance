@@ -607,6 +607,70 @@ should_widen(n_children::Int, na::Int; k::Real = MCTS_K_OBS, α::Real = MCTS_ALP
     n_children <= k * (max(na, 1)^α)
 
 # =========================================================================
+# SHARED per-step belief update (predict → asymmetric cadence correct).
+#
+# This is the single source of truth for "advance a belief one dt step under an
+# action, applying the asymmetric measurement cadence." BOTH the MCTS expansion
+# (`expand_child`, which simulates this step in the tree) AND the real-world
+# closed-loop executor (`beliefExecutor.jl`, which does it for real once per
+# executed step) call this, so the belief the planner assumes internally and the
+# belief actually tracked in execution are updated by IDENTICAL code — they
+# cannot silently drift (the correctness point of the receding-horizon driver).
+#
+# It returns the updated belief AND the advanced cadence timers, so the caller
+# can carry `since_sc`/`since_debris` forward. The observation `z` is drawn HERE
+# (a genuine random draw of the true next state, architecture §4 step 3) only
+# when at least one object is due for a fix, so the sampling is identical on both
+# paths. Only the belief is touched — tree bookkeeping (nodes, Pc caching,
+# terminal marking, reward) stays in the callers, which is not a belief concern.
+# =========================================================================
+
+"""
+    step_belief(pomdp, b, a, s_true_next, rng; dt=pomdp.dt, cadence_sc=..., cadence_debris=...,
+                since_sc, since_debris) -> (b′::Belief, since_sc′, since_debris′)
+
+Advance belief `b` one `dt` step under action `a` (architecture §4 steps 2–4),
+applying the asymmetric measurement cadence. `predict` first (Σ grows one step;
+maneuver kicks the SC mean), then correct the object(s) whose fix is due this
+step against a freshly sampled observation of the true next state `s_true_next`.
+An object's fix is due when its elapsed-time timer (`since_* + dt`) reaches its
+cadence, at which point the timer resets to 0; otherwise the timer carries the
+step forward and that object is predict-only. Returns the updated belief and the
+advanced timers. Shared by `expand_child` (in-tree simulation) and the
+closed-loop executor (real-world update) so the two stay bit-for-bit consistent.
+"""
+function step_belief(pomdp::SpacecraftCAPOMDP, b::Belief, a::CAAction,
+                     s_true_next::CAState, rng::AbstractRNG;
+                     dt::Real = pomdp.dt,
+                     cadence_sc::Real = pomdp.cadence_sc,
+                     cadence_debris::Real = pomdp.cadence_debris,
+                     since_sc::Real, since_debris::Real)
+    # predict the belief forward one dt step (Phase 4). Σ GROWS this step.
+    b = predict(pomdp, b, a; dt = dt)
+
+    # asymmetric cadence: correct only the object(s) whose fix is due. A fix is
+    # due when the time since the object's last fix has reached its cadence; the
+    # timer resets on a fix, else carries forward.
+    since_sc     = Float64(since_sc)     + Float64(dt)
+    since_debris = Float64(since_debris) + Float64(dt)
+    correct_sc     = since_sc     >= cadence_sc
+    correct_debris = since_debris >= cadence_debris
+
+    if correct_sc || correct_debris
+        z = sample_observation(pomdp, a, s_true_next, rng)  # one genuine draw
+        if correct_sc
+            b = correct_linear_sc(pomdp, b, z)
+            since_sc = 0.0
+        end
+        if correct_debris
+            b = correct_linear_debris(pomdp, b, z)
+            since_debris = 0.0
+        end
+    end
+    return b, since_sc, since_debris
+end
+
+# =========================================================================
 # Expansion: one action's predict→sample z→correct + true-state transition.
 # Produces a child BeliefNode and the step reward for reaching it.
 # =========================================================================
@@ -649,28 +713,14 @@ function expand_child(pomdp::SpacecraftCAPOMDP, node::BeliefNode, a::CAAction,
     # 1. propagate the sampled true state (Phase 0 dynamics)
     sp = rand(rng, POMDPs.transition(pomdp, node.s_true, a))
 
-    # 2. predict the belief forward one dt step (Phase 4). Σ GROWS this step.
-    b = predict(pomdp, node.belief, a; dt = dt)
-
-    # 3–4. asymmetric cadence: correct only the object(s) whose fix is due.
-    # A fix is due for an object when the time since its last fix has reached its
-    # cadence. Timers carry the parent's elapsed time forward by one dt step.
-    since_sc     = node.since_sc     + Float64(dt)
-    since_debris = node.since_debris + Float64(dt)
-    correct_sc     = since_sc     >= cadence_sc
-    correct_debris = since_debris >= cadence_debris
-
-    if correct_sc || correct_debris
-        z = sample_observation(pomdp, a, sp, rng)   # one genuine draw of the true state
-        if correct_sc
-            b = correct_linear_sc(pomdp, b, z)
-            since_sc = 0.0                           # fix taken → reset the timer
-        end
-        if correct_debris
-            b = correct_linear_debris(pomdp, b, z)
-            since_debris = 0.0
-        end
-    end
+    # 2–4. predict + asymmetric-cadence correct — the SHARED per-step belief
+    # update (see `step_belief`). The executor calls the SAME helper, so the
+    # in-tree belief and the real-world belief evolve by identical code.
+    b, since_sc, since_debris = step_belief(pomdp, node.belief, a, sp, rng;
+                                            dt = dt, cadence_sc = cadence_sc,
+                                            cadence_debris = cadence_debris,
+                                            since_sc = node.since_sc,
+                                            since_debris = node.since_debris)
 
     child = BeliefNode(b, sp, isterminal(pomdp, sp);
                        since_sc = since_sc, since_debris = since_debris)

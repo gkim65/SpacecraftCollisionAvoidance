@@ -357,7 +357,7 @@ a **per-step chance-constraint check** (architecture §4 steps 5–6, §7):
 julia --project=. src/tests/test_belief_mcts.jl
 ```
 
-120 checks in 13 groups: the five Phase-5 mechanics groups above (**UCB
+156 checks in 14 groups: the five Phase-5 mechanics groups above (**UCB
 selection**, **backup arithmetic**, **progressive widening**, **tree health**,
 **determinism**); five Phase-6 groups — **Pc-at-TCA from a node** (finite, in
 [0,1], matches a direct `chan_pc` on the mean + the node's accumulated Σ propagated
@@ -376,7 +376,11 @@ budget-split / seed / Na-weighted-Q-merge helpers are arithmetically correct, th
 local-fallback parallel plan is reproducible under a fixed master seed and picks
 the same action as serial, and a real 2-worker multiprocess plan (each worker its
 own Brahe interpreter) is reproducible under a fixed master seed and agrees with
-serial on the action.
+serial on the action; and the **closed-loop executor** group (below) — a short
+executed episode terminates within the horizon with a well-formed trace (finite,
+time-remaining decreasing by `dt`, Pc in [0,1], Δv only on `MANEUVER` steps), the
+`episode_summary` roll-up is consistent, and the `dt`-consistency guard throws when
+`planner.dt ≠ pomdp.dt`.
 
 Same Brahe-only dependency as the other tests. Note: Pc evaluation is the search
 bottleneck (Brahe numerical propagations). The `:fast` `sigma_mode` (default,
@@ -422,11 +426,13 @@ corrected only about every **8 h**. Both are noisy full-state observations
 (linear `H = I` — a TLE and a GPS solution are each a fitted state estimate, so
 this is faithful, not a shortcut; EKF/UKF are deferred, see the design doc).
 
-The MCTS applies the cadence in `expand_child`: the belief is **predicted every
-step** (Σ grows), but an object is **corrected only when its fix is due**. Each
-`BeliefNode` carries `since_sc` / `since_debris` (seconds since that object's last
-fix); a correction (`correct_linear_sc` / `correct_linear_debris`) fires for an
-object once its timer crosses the object's cadence, then resets. Between TLEs the
+The cadence lives in the shared per-step belief update `step_belief` (called by
+`expand_child` in-tree and by the closed-loop executor for real — see below): the
+belief is **predicted every step** (Σ grows), but an object is **corrected only
+when its fix is due**. Each `BeliefNode` carries `since_sc` / `since_debris`
+(seconds since that object's last fix); a correction (`correct_linear_sc` /
+`correct_linear_debris`) fires for an object once its timer crosses the object's
+cadence, then resets. Between TLEs the
 debris covariance grows freely — over an 8 h coast the debris position 1σ ramps
 from ~50 m to ~5 km before the next TLE snaps it back — making the debris the
 dominant, evolving uncertainty. `cadence_sc`, `cadence_debris`, and the
@@ -436,3 +442,47 @@ a predict-only step advances the timers, a fix step resets the timer and shrinks
 that object's Σ relative to the same step's predict-only counterpart (at
 `σ_debris = 1 km` a single TLE fix is weak, so it need not pull Σ below its prior
 value), and the `correct_at_root` phase behavior.
+
+### Closed-loop episode driver (receding-horizon / MPC executor)
+
+`plan` decides a single action; `run_episode` (`src/utils/beliefExecutor.jl`) is
+the **outer loop** that executes a whole episode: from the current belief + true
+state it plans one action, **executes** it by advancing the *true* state one `dt`
+step via `POMDPs.transition`, **updates** the tracked belief with the same
+`step_belief` update the planner uses internally (predict → sample a real
+observation → cadence-aware correct, carrying `since_sc` / `since_debris` and the
+`correct_at_root` phase), then **re-plans** from the updated belief — repeating
+until TCA or collision (`isterminal`). Because the executor and the planner share
+`step_belief`, the belief actually tracked in execution matches the belief the
+planner assumed internally (they cannot drift — the correctness point of MPC here).
+All planner knobs (`sigma_mode`, `parallel`, `constraint_mode`, `dt`, cadences,
+budget) pass straight through the `MCTSPlanner`. `POMDPs.transition` advances the
+true state by `pomdp.dt`, so `run_episode` asserts `planner.dt == pomdp.dt`.
+
+`run_episode` returns a per-step trace (`Vector{ExecStep}`: step index,
+time-remaining, action, Δv spent that step, Pc-at-TCA, true miss distance) for
+inspection/plotting, and `episode_summary` rolls it up (total Δv, maneuver count,
+final/peak Pc, final miss). This is a **single-episode** driver on one fixture —
+multi-seed per-episode statistics are Phase 10. Test group 14 runs one short
+episode end-to-end and asserts the trace is well-formed. To run a demo episode:
+
+```julia
+using Random
+include("src/SpacecraftCollisionAvoidance.jl")   # + Brahe deps, as elsewhere
+
+pomdp = SpacecraftCAPOMDP(seed = 42, randAdd = false, dt = 60*60, TCA_max = 6*60*60)
+
+# fixture: place a cross-track conjunction at TCA, then propagate both objects
+# back by the window so the planner has room to act (same as the test helper).
+sc_tca, db_tca = generate_conjunction_geometry(pomdp; geometry = :cross_track,
+                                               miss_m = 200.0, v_rel = 15.0)
+bh = get_brahe(); et = epoch_to_tuple(bh.Epoch.from_datetime(pomdp.epochTCA..., bh.TimeSystem.UTC))
+t  = 6 * pomdp.dt
+psc, ep0 = eci2orb_brahe(sc_tca, et, pomdp.satParams, pomdp.forceModel)
+pdb, _   = eci2orb_brahe(db_tca, et, pomdp.debrisParams, pomdp.forceModel)
+psc.propagate_to(ep0 - Float64(t)); pdb.propagate_to(ep0 - Float64(t))
+s0 = CAState(collect(psc.current_state()[1:6]), collect(pdb.current_state()[1:6]), Float64(t))
+
+planner = MCTSPlanner(pomdp; n_iterations = 60, max_depth = 6, dt = pomdp.dt)
+trace   = run_episode(planner, pomdp, s0, MersenneTwister(7))
+```

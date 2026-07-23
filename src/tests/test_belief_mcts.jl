@@ -67,6 +67,7 @@ include(joinpath(@__DIR__, "..", "observations.jl"))
 include(joinpath(@__DIR__, "..", "transitions.jl"))
 include(joinpath(@__DIR__, "..", "utils", "beliefTracker.jl"))
 include(joinpath(@__DIR__, "..", "utils", "beliefMCTS.jl"))
+include(joinpath(@__DIR__, "..", "utils", "beliefExecutor.jl"))
 
 # --- Phase 4 belief-health helpers (reused) -----------------------------------
 _issym(A) = maximum(abs.(Matrix(A) .- transpose(Matrix(A)))) == 0.0
@@ -662,6 +663,70 @@ end
         finally
             isempty(added) || rmprocs(added)
         end
+    end
+
+    # -----------------------------------------------------------------
+    @testset "14. Closed-loop episode driver (Phase 6.5 MPC executor)" begin
+        # A short executed episode on the Phase-5/6 end-to-end fixture: a few
+        # steps, modest sims, sigma_mode = :fast, serial. Asserts the trace is
+        # WELL-FORMED — finite, terminates, Pc in [0,1], Δv only on MANEUVER —
+        # and that the shared belief update keeps the executor consistent with the
+        # planner's internal step.
+        nsteps = 4
+        pomdp = SpacecraftCAPOMDP(seed = 42, randAdd = false, dt = 60 * 60,
+                                  TCA_max = nsteps * 60 * 60)
+        s0 = make_conjunction_state(pomdp; miss_m = 200.0, v_rel = 15.0,
+                                    geometry = :cross_track, t = nsteps * pomdp.dt)
+        planner = MCTSPlanner(pomdp; n_iterations = 30, max_depth = nsteps,
+                              dt = pomdp.dt, sigma_mode = :fast)
+
+        trace = run_episode(planner, pomdp, s0, MersenneTwister(7))
+
+        # (a) terminates: nonempty, no longer than the horizon, and the last step
+        #     reaches TCA (t_remaining - dt ≤ 0) or a collision was hit early.
+        @test !isempty(trace)
+        @test length(trace) <= nsteps
+        @test trace[end].t_remaining - pomdp.dt <= 0.0 || length(trace) < nsteps
+
+        # (b) step indices are 1..n and time-remaining decreases by dt each step.
+        for (i, s) in enumerate(trace)
+            @test s.step == i
+            @test s.action == WAIT || s.action == MANEUVER
+        end
+        for i in 2:length(trace)
+            @test trace[i].t_remaining ≈ trace[i-1].t_remaining - pomdp.dt
+        end
+        @test trace[1].t_remaining ≈ s0.t
+
+        # (c) every logged quantity is finite; Pc is a probability in [0, 1].
+        for s in trace
+            @test isfinite(s.t_remaining) && isfinite(s.Δv) &&
+                  isfinite(s.pc) && isfinite(s.miss)
+            @test 0.0 <= s.pc <= 1.0
+            @test s.miss >= 0.0
+        end
+
+        # (d) Δv is spent ONLY on MANEUVER steps, and is exactly pomdp.Δv there.
+        for s in trace
+            if s.action == MANEUVER
+                @test s.Δv ≈ pomdp.Δv
+            else
+                @test s.Δv == 0.0
+            end
+        end
+
+        # (e) episode_summary rolls the trace up consistently.
+        summ = episode_summary(trace)
+        @test summ.n_steps == length(trace)
+        @test summ.total_Δv ≈ sum(s.Δv for s in trace)
+        @test summ.n_maneuvers == count(s -> s.action == MANEUVER, trace)
+        @test summ.total_Δv ≈ summ.n_maneuvers * pomdp.Δv
+
+        # (f) the dt-consistency guard fires when planner.dt ≠ pomdp.dt (the
+        #     executed world steps by pomdp.dt; the planner must match it).
+        bad = MCTSPlanner(pomdp; n_iterations = 5, max_depth = nsteps,
+                          dt = pomdp.dt / 2, sigma_mode = :fast)
+        @test_throws AssertionError run_episode(bad, pomdp, s0, MersenneTwister(7))
     end
 
 end
