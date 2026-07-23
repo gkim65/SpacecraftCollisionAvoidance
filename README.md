@@ -340,12 +340,24 @@ a **per-step chance-constraint check** (architecture §4 steps 5–6, §7):
   expanding, so a violate-then-recover wait-and-measure branch is not amputated),
   `:terminate` (also mark the branch terminal), `:off` (no-constraint baseline).
   Each `BeliefNode` records its `pc` / `violated` for ablation.
+- `sigma_mode` (planner arg, **efficiency pass**): `:fast` (default) precomputes
+  the **debris** Σ-at-TCA **per tree depth** once per `plan` (`build_sigma_tca_table`)
+  and looks it up per node, propagating only the debris *mean* + the full satellite
+  belief per node; `:exact` is the fully-per-node path kept as the correctness
+  oracle. This is valid because the debris Σ-at-a-given-depth is **bitwise
+  branch-invariant** (`predict`'s `Σ⁻=ΦΣΦᵀ` is maneuver-independent and the cadence
+  correction's `Σ⁺=(I−K)Σ⁻` is observation-independent), so `:fast` gives a Pc
+  **identical** to `:exact` (verified 0.0 relative diff) at roughly **1.85× less
+  cost per node**. The satellite Σ is *not* tabled — it is propagated exactly per
+  node (it is only weakly branch-invariant). **`:fast` is valid only under
+  noiseless maneuvers; Phase 8's maneuver process noise makes even the debris Σ
+  action-dependent, so Phase 8 must switch to `:exact`.**
 
 ```bash
 julia --project=. src/tests/test_belief_mcts.jl
 ```
 
-64 checks in 11 groups: the five Phase-5 mechanics groups above (**UCB
+100 checks in 12 groups: the five Phase-5 mechanics groups above (**UCB
 selection**, **backup arithmetic**, **progressive widening**, **tree health**,
 **determinism**); five Phase-6 groups — **Pc-at-TCA from a node** (finite, in
 [0,1], matches a direct `chan_pc` on the mean + the node's accumulated Σ propagated
@@ -356,12 +368,17 @@ magnitude smaller, noting the once-per-orbit ripple); **per-step constraint**
 a violating child terminal); **leaf == cutoff** (identical Pc-at-TCA value);
 **end-to-end + ablation** — on a real cross-track conjunction the planner prefers
 the maneuver that lowers Pc-at-TCA, and `:terminate` prunes more violating nodes
-than `:penalize`; and the **asymmetric measurement cadence** group (below).
+than `:penalize`; the **asymmetric measurement cadence** group (below); and the
+**fast Σ path** group — the per-depth debris Σ table reproduces the exact per-node
+debris Σ-at-TCA, and `sigma_mode = :fast` yields a Pc (and an end-to-end action +
+tree) identical to `:exact`.
 
-Same Brahe-only dependency as the other tests. Note: Pc evaluation is ~172 ms
-per node (two Brahe numerical propagations), so a `plan` call over a multi-hour
-window takes minutes — the search-efficiency pass (Julia-level threading of the
-per-node propagations) is deferred to a later task.
+Same Brahe-only dependency as the other tests. Note: Pc evaluation is the search
+bottleneck (Brahe numerical propagations). The `:fast` `sigma_mode` (default,
+above) cuts it to ~1.85× less per node by tabling the branch-invariant debris Σ,
+but a `plan` over a multi-hour window is still minutes: the next efficiency lever
+is **multiprocess root-parallel search** (one Brahe interpreter per worker
+process — PyCall's GIL rules out in-process threading), deferred to its own task.
 
 ### Asymmetric measurement realism — sourced noise + per-object cadence
 

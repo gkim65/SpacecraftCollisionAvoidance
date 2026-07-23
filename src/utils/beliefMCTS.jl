@@ -115,6 +115,16 @@ const MCTS_PC_REWARD_WEIGHT    = 1.0e6    # reward = −weight·Pc (at-threshold
 const MCTS_PC_VIOLATION_PENALTY = 100.0   # penalty when Pc > threshold (≫ maneuver_cost)
 const MCTS_CONSTRAINT_MODE     = :penalize   # :penalize | :terminate | :off
 
+# Σ-propagation mode for the Pc eval (efficiency pass, 2026-07-23):
+#   :fast  — precompute the branch-invariant DEBRIS Σ-at-TCA per depth ONCE per
+#            plan, look it up per node; propagate only the debris MEAN + the full
+#            satellite belief per node. Pc-EXACT (debris Σ is bitwise-invariant),
+#            ~2× faster. VALID ONLY under noiseless maneuvers (breaks at Phase 8).
+#   :exact — propagate every node's full belief (mean+Σ, both objects) to TCA.
+#            The correctness oracle; the ONLY valid mode once Phase 8 adds
+#            maneuver noise. See node_pc_at_tca / the FAST Σ PATH section header.
+const MCTS_SIGMA_MODE = :fast
+
 # =========================================================================
 # Tree node.  Reuses Phase 4's `Belief` (two 6×6 sub-beliefs + time-remaining)
 # as the belief — NOT a new (μ,Σ) container.  Carries the sampled true CAState
@@ -256,6 +266,227 @@ function node_pc_at_tca(pomdp::SpacecraftCAPOMDP, node::BeliefNode)
 end
 
 # =========================================================================
+# FAST Σ PATH — precompute the DEBRIS Σ-at-TCA once per DEPTH, index by depth
+# (efficiency pass, 2026-07-23). Cuts the per-node Pc cost by removing the
+# DEBRIS STM/covariance propagation — one of the two expensive brahe propagations
+# per node. (Measured: a mean+Σ grow is ~11× a mean-only grow; the STM/covariance
+# history is essentially the whole cost of a grow. So replacing the debris mean+Σ
+# grow with a table lookup + a mean-only grow roughly halves the per-node Pc cost:
+# ~680 → ~370 ms/node ≈ 1.8× on this machine.)
+#
+# SCOPE DECISION (Grace, 2026-07-23): precompute ONLY the debris Σ (which is
+# BITWISE branch-invariant — see below), and keep the SATELLITE Σ propagated
+# EXACTLY per node. The satellite Σ is only weakly branch-invariant (a maneuver
+# perturbs its STM ~1.7–9% across a WAIT vs MANEUVER path at equal depth); rather
+# than approximate it, we propagate it exactly, so the fast path's Pc is EXACT
+# (no satellite approximation anywhere). The cost we give up is that the surviving
+# satellite propagation is still the expensive STM kind — hence ~2×, not the ~11×
+# a both-objects precompute would give. This was the deliberate accuracy-over-speed
+# call; revisit if the satellite propagation later becomes the bottleneck.
+#
+# WHY THE DEBRIS PRECOMPUTE IS EXACT (verified 2026-07-23; see the session note +
+# TODOS Phase-5 extensions): the accumulated debris belief Σ at a given tree DEPTH
+# is a pure function of depth, NOT of the branch —
+#   • predict's Σ⁻ = Φ Σ Φᵀ is maneuver-independent (noiseless maneuvers, §8) and
+#     the debris never gets a maneuver kick, so its STM reference trajectory (its
+#     mean) is identical on every branch between TLE fixes;
+#   • the cadence correct's Σ⁺ = (I−K)Σ⁻ is z-independent (the load-bearing
+#     linear-Gaussian property, beliefTracker.jl), and the cadence timer schedule
+#     (which steps get a fix) is itself deterministic in depth.
+# The result is a SAWTOOTH under the ~8 h cadence (Σ grows between TLE fixes, snaps
+# at each fix), NOT a smooth Φ P0 Φᵀ curve — so we replay the exact predict/correct
+# Σ sequence ONCE along a reference WAIT trajectory and index by depth. Verified:
+# WAIT-path vs MANEUVER-path debris Σ-at-TCA agree to 0.0 rel diff at every depth.
+#
+# WHAT STAYS PER-NODE: both MEANS (a maneuver moves the SC mean; each branch's
+# sampled GPS/TLE observations nudge the means, μ⁺ depends on z) AND the full
+# satellite belief (mean+Σ). The DEBRIS mean is propagated mean-only (no
+# initial_covariance ⇒ no STM history) — the ~11×-cheaper propagation — since its
+# Σ now comes from the table.
+#
+# ⚠️ BREAKS AT PHASE 8 (maneuver execution noise). Process noise Q(a) makes even
+# the DEBRIS Σ genuinely action-sequence-dependent — the per-depth table is then
+# no longer branch-invariant and this fast path is INVALID. Phase 8 must switch
+# back to per-node Σ (sigma_mode = :exact — kept as the oracle for exactly this
+# reason). Do NOT silently rely on :fast past Phase 8.
+# =========================================================================
+
+"""
+    SigmaTCATable
+
+Precomputed DEBRIS Σ-at-TCA per tree depth (efficiency pass). `Σ_db[d+1]` is the
+debris ECI covariance-at-TCA for a node at depth `d` (`d = 0` is the root). Built
+once per plan by `build_sigma_tca_table`; consumed by `node_pc_at_tca_fast` under
+`sigma_mode = :fast`. The spacecraft Σ is NOT tabled — it is propagated exactly
+per node (see the section header). Valid only under noiseless maneuvers + the
+linear-Gaussian update (breaks at Phase 8). `dt` / `cadence_*` / `correct_at_root`
+record the schedule the table was built for so a stale table can be detected.
+"""
+struct SigmaTCATable
+    Σ_db::Vector{Matrix{Float64}}
+    dt::Float64
+    cadence_sc::Float64
+    cadence_debris::Float64
+    correct_at_root::Bool
+end
+
+"""
+    _grow_mean_to_tca(pomdp, μ, objParams, t) -> μ_tca
+
+Propagate one object's belief MEAN from time-remaining `t` to TCA under the
+accurate force model, WITHOUT the covariance/STM history — the ~11×-cheaper
+propagation (measured: mean-only ~30 ms vs. mean+Σ ~340 ms). Used by the fast Pc
+path for the DEBRIS, whose Σ comes from the precomputed per-depth table instead.
+"""
+function _grow_mean_to_tca(pomdp::SpacecraftCAPOMDP, μ::AbstractVector,
+                           objParams::AbstractVector, t::Real)
+    bh = get_brahe()
+    epoch_tca     = bh.Epoch.from_datetime(pomdp.epochTCA..., bh.TimeSystem.UTC)
+    epoch_current = epoch_tca - Float64(t)
+    prop, ep0 = eci2orb_brahe(collect(float.(μ)), epoch_to_tuple(epoch_current),
+                              objParams, pomdp.forceModel)   # no initial_covariance ⇒ no STM
+    ep_tca = ep0 + Float64(t)
+    prop.propagate_to(ep_tca)
+    return collect(prop.current_state()[1:6])
+end
+
+"""
+    _grow_sigma_to_tca(pomdp, μ_ref, Σ, objParams, t) -> Σ_tca_eci
+
+Grow one object's belief covariance `Σ` from time-remaining `t` to TCA along the
+reference mean trajectory `μ_ref` (which sets the STM), returning Σ-at-TCA (ECI).
+Same brahe path as `_grow_belief_to_tca` but returns only Σ. Used to build the
+debris per-depth table along the (branch-invariant) debris WAIT trajectory.
+"""
+function _grow_sigma_to_tca(pomdp::SpacecraftCAPOMDP, μ_ref::AbstractVector,
+                            Σ::AbstractMatrix, objParams::AbstractVector, t::Real)
+    bh = get_brahe()
+    epoch_tca     = bh.Epoch.from_datetime(pomdp.epochTCA..., bh.TimeSystem.UTC)
+    epoch_current = epoch_tca - Float64(t)
+    prop, ep0 = eci2orb_brahe(collect(float.(μ_ref)), epoch_to_tuple(epoch_current),
+                              objParams, pomdp.forceModel; initial_covariance = Matrix(Σ))
+    ep_tca = ep0 + Float64(t)
+    prop.propagate_to(ep_tca)
+    return _sym(collect(prop.covariance_gcrf(ep_tca)))
+end
+
+"""
+    build_sigma_tca_table(pomdp, root; dt=..., cadence_sc=..., cadence_debris=...,
+                          max_depth=MCTS_MAX_DEPTH) -> SigmaTCATable
+
+Precompute the DEBRIS Σ-at-TCA per depth for the fast Pc path (efficiency pass).
+Replays the belief-Σ evolution the tree produces for the debris — `predict` (Σ
+grows one dt step) then the ~8 h cadence `correct` (Σ shrinks when a TLE fix is
+due) — along a reference WAIT trajectory from `root`, capturing the accumulated
+debris Σ at each depth `d`, then grows each depth's Σ to TCA. Because the debris Σ
+update is maneuver-independent (predict) and z-independent (correct), and the
+cadence schedule is deterministic in depth, this single WAIT replay reproduces the
+per-depth debris Σ EXACTLY on every branch (verified 0.0 rel diff WAIT vs MANEUVER).
+
+The correction uses a zero-innovation observation (`z = μ⁻`): Σ⁺ is z-independent,
+so this yields the identical Σ the tree would while keeping the reference mean on
+the deterministic WAIT trajectory (which sets the STM). Only the debris sub-belief
+Σ is captured; the reference sat mean advances too (needed to keep `predict`
+well-formed) but its Σ is discarded (the sat Σ is propagated exactly per node).
+
+Cost: ~`max_depth` STM propagations, ONCE per plan (vs. one debris propagation per
+node before).
+"""
+function build_sigma_tca_table(pomdp::SpacecraftCAPOMDP, root::BeliefNode;
+                               dt::Real = pomdp.dt,
+                               cadence_sc::Real = pomdp.cadence_sc,
+                               cadence_debris::Real = pomdp.cadence_debris,
+                               max_depth::Int = MCTS_MAX_DEPTH)
+    Σ_db = Matrix{Float64}[]
+
+    b = root.belief
+    since_sc     = root.since_sc
+    since_debris = root.since_debris
+
+    # depth 0 (root): grow the root debris Σ to TCA along its own mean.
+    push!(Σ_db, b.t <= PC_TAU_MATCH_ATOL ? Matrix(b.debris.Σ) :
+          _grow_sigma_to_tca(pomdp, b.debris.μ, b.debris.Σ, pomdp.debrisParams, b.t))
+
+    for _ in 1:max_depth
+        # PREDICT one dt step along the WAIT spine (a == WAIT: no maneuver kick;
+        # Σ grows regardless of action, so WAIT is the right reference).
+        b = predict(pomdp, b, WAIT; dt = dt)
+
+        # asymmetric cadence: correct the object(s) whose fix is due this step.
+        # Σ⁺ = (I−K)Σ⁻ is z-independent, so a zero-innovation z (= μ⁻) gives the
+        # exact tree Σ while keeping the reference mean on the WAIT trajectory.
+        since_sc     += Float64(dt)
+        since_debris += Float64(dt)
+        correct_sc     = since_sc     >= cadence_sc
+        correct_debris = since_debris >= cadence_debris
+        if correct_sc || correct_debris
+            z = vcat(b.sc.μ, b.debris.μ)      # zero-innovation observation
+            if correct_sc
+                b = correct_linear_sc(pomdp, b, z);     since_sc = 0.0
+            end
+            if correct_debris
+                b = correct_linear_debris(pomdp, b, z); since_debris = 0.0
+            end
+        end
+
+        push!(Σ_db, b.t <= PC_TAU_MATCH_ATOL ? Matrix(b.debris.Σ) :
+              _grow_sigma_to_tca(pomdp, b.debris.μ, b.debris.Σ, pomdp.debrisParams, b.t))
+    end
+
+    return SigmaTCATable(Σ_db, Float64(dt), Float64(cadence_sc),
+                         Float64(cadence_debris), pomdp.correct_at_root)
+end
+
+"""
+    node_pc_at_tca_fast(pomdp, node, depth, table) -> Float64
+
+Fast Pc-at-TCA (efficiency pass): propagate the SATELLITE belief exactly (mean+Σ
+to TCA — the sat Σ is not tabled), propagate only the DEBRIS mean (mean-only, the
+~11×-cheaper propagation) and read the debris Σ-at-TCA for this `depth` from the
+precomputed `table`, then call `chan_pc`. Numerically EXACT vs. `node_pc_at_tca`
+(`:exact`): the debris Σ is bitwise branch-invariant (table lookup == per-node
+propagation) and the satellite is propagated per node, so no approximation is
+introduced. `depth` is the node's tree depth (root = 0); deeper than the table was
+built for falls back to the exact path.
+"""
+function node_pc_at_tca_fast(pomdp::SpacecraftCAPOMDP, node::BeliefNode,
+                             depth::Int, table::SigmaTCATable)
+    b = node.belief
+    t = b.t
+    hbr = pomdp.R_hard_body_sc + pomdp.R_hard_body_debris
+    idx = depth + 1
+    if idx > length(table.Σ_db)
+        return node_pc_at_tca(pomdp, node)          # out of table range → exact
+    end
+    if t <= PC_TAU_MATCH_ATOL
+        return chan_pc(b.sc.μ, b.debris.μ, b.sc.Σ, table.Σ_db[idx], hbr)
+    end
+    μ_sc_tca, Σ_sc_tca = _grow_belief_to_tca(pomdp, b.sc.μ, b.sc.Σ, pomdp.satParams, t)  # sat exact
+    μ_db_tca           = _grow_mean_to_tca(pomdp, b.debris.μ, pomdp.debrisParams, t)     # debris mean-only
+    return chan_pc(μ_sc_tca, μ_db_tca, Σ_sc_tca, table.Σ_db[idx], hbr)
+end
+
+"""
+    node_pc(pomdp, node; depth=nothing, table=nothing, sigma_mode=MCTS_SIGMA_MODE) -> Float64
+
+Dispatch the Pc-at-TCA computation for `node` between the fast per-depth path
+(`:fast`, requires `depth` and a `table` from `build_sigma_tca_table`) and the
+exact per-node path (`:exact`). Falls back to `:exact` if `:fast` is requested but
+no `table`/`depth` is supplied (so a caller without a table still works). This is
+the single entry point the reward + leaf value call, so switching modes is one
+flag on the planner.
+"""
+function node_pc(pomdp::SpacecraftCAPOMDP, node::BeliefNode;
+                 depth::Union{Int,Nothing} = nothing,
+                 table::Union{SigmaTCATable,Nothing} = nothing,
+                 sigma_mode::Symbol = MCTS_SIGMA_MODE)
+    if sigma_mode == :fast && table !== nothing && depth !== nothing
+        return node_pc_at_tca_fast(pomdp, node, depth, table)
+    end
+    return node_pc_at_tca(pomdp, node)
+end
+
+# =========================================================================
 # Reward — Pc-BASED + the per-step chance constraint (Phase 6; architecture §4
 # step 5–6, §7). Replaces the Phase 5 miss-distance placeholder wholesale.
 #
@@ -293,8 +524,13 @@ tree for the ablation, and — under `:terminate` — to mark the branch termina
 function step_reward(pomdp::SpacecraftCAPOMDP, a::CAAction, child::BeliefNode;
                      constraint_mode::Symbol = MCTS_CONSTRAINT_MODE,
                      pc_weight::Real = MCTS_PC_REWARD_WEIGHT,
-                     pc_penalty::Real = MCTS_PC_VIOLATION_PENALTY)
-    pc = isnan(child.pc) ? node_pc_at_tca(pomdp, child) : child.pc
+                     pc_penalty::Real = MCTS_PC_VIOLATION_PENALTY,
+                     depth::Union{Int,Nothing} = nothing,
+                     table::Union{SigmaTCATable,Nothing} = nothing,
+                     sigma_mode::Symbol = MCTS_SIGMA_MODE)
+    pc = isnan(child.pc) ?
+         node_pc(pomdp, child; depth = depth, table = table, sigma_mode = sigma_mode) :
+         child.pc
     child.pc = pc
     violated = pc > pomdp.pc_threshold
     child.violated = violated
@@ -393,7 +629,10 @@ function expand_child(pomdp::SpacecraftCAPOMDP, node::BeliefNode, a::CAAction,
                       cadence_debris::Real = pomdp.cadence_debris,
                       constraint_mode::Symbol = MCTS_CONSTRAINT_MODE,
                       pc_weight::Real = MCTS_PC_REWARD_WEIGHT,
-                      pc_penalty::Real = MCTS_PC_VIOLATION_PENALTY)
+                      pc_penalty::Real = MCTS_PC_VIOLATION_PENALTY,
+                      depth::Union{Int,Nothing} = nothing,
+                      table::Union{SigmaTCATable,Nothing} = nothing,
+                      sigma_mode::Symbol = MCTS_SIGMA_MODE)
     # 1. propagate the sampled true state (Phase 0 dynamics)
     sp = rand(rng, POMDPs.transition(pomdp, node.s_true, a))
 
@@ -426,7 +665,8 @@ function expand_child(pomdp::SpacecraftCAPOMDP, node::BeliefNode, a::CAAction,
     # 5–6. Pc-at-TCA + per-step chance constraint (§4 step 6). Caches pc/violated.
     r, _, violated = step_reward(pomdp, a, child;
                                  constraint_mode = constraint_mode,
-                                 pc_weight = pc_weight, pc_penalty = pc_penalty)
+                                 pc_weight = pc_weight, pc_penalty = pc_penalty,
+                                 depth = depth, table = table, sigma_mode = sigma_mode)
     if constraint_mode == :terminate && violated
         child.is_terminal = true       # amputate the branch past a violation
     end
@@ -456,8 +696,13 @@ step during backup.
 function leaf_value(pomdp::SpacecraftCAPOMDP, node::BeliefNode;
                     constraint_mode::Symbol = MCTS_CONSTRAINT_MODE,
                     pc_weight::Real = MCTS_PC_REWARD_WEIGHT,
-                    pc_penalty::Real = MCTS_PC_VIOLATION_PENALTY)
-    pc = isnan(node.pc) ? node_pc_at_tca(pomdp, node) : node.pc
+                    pc_penalty::Real = MCTS_PC_VIOLATION_PENALTY,
+                    depth::Union{Int,Nothing} = nothing,
+                    table::Union{SigmaTCATable,Nothing} = nothing,
+                    sigma_mode::Symbol = MCTS_SIGMA_MODE)
+    pc = isnan(node.pc) ?
+         node_pc(pomdp, node; depth = depth, table = table, sigma_mode = sigma_mode) :
+         node.pc
     node.pc = pc
     violated = pc > pomdp.pc_threshold
     node.violated = violated
@@ -492,10 +737,14 @@ function simulate!(pomdp::SpacecraftCAPOMDP, node::BeliefNode, depth::Int,
                    c::Real = MCTS_UCB_C, k::Real = MCTS_K_OBS, α::Real = MCTS_ALPHA_OBS,
                    constraint_mode::Symbol = MCTS_CONSTRAINT_MODE,
                    pc_weight::Real = MCTS_PC_REWARD_WEIGHT,
-                   pc_penalty::Real = MCTS_PC_VIOLATION_PENALTY)
+                   pc_penalty::Real = MCTS_PC_VIOLATION_PENALTY,
+                   node_depth::Int = 0,
+                   table::Union{SigmaTCATable,Nothing} = nothing,
+                   sigma_mode::Symbol = MCTS_SIGMA_MODE)
     if node.is_terminal || depth <= 0
         return leaf_value(pomdp, node; constraint_mode = constraint_mode,
-                          pc_weight = pc_weight, pc_penalty = pc_penalty)
+                          pc_weight = pc_weight, pc_penalty = pc_penalty,
+                          depth = node_depth, table = table, sigma_mode = sigma_mode)
     end
 
     node.N += 1
@@ -505,14 +754,17 @@ function simulate!(pomdp::SpacecraftCAPOMDP, node::BeliefNode, depth::Int,
     na = get(node.Na, a, 0)
     kids = get!(node.children, a, BeliefNode[])
 
-    # observation progressive widening (POMCPOW rule)
+    # observation progressive widening (POMCPOW rule). The child sits one tree
+    # level deeper than `node`, so its per-depth Σ table index is node_depth + 1.
+    child_depth = node_depth + 1
     local child::BeliefNode
     local r::Float64
     if should_widen(length(kids), na; k = k, α = α)
         child, r = expand_child(pomdp, node, a, rng; dt = dt,
                                 cadence_sc = cadence_sc, cadence_debris = cadence_debris,
                                 constraint_mode = constraint_mode,
-                                pc_weight = pc_weight, pc_penalty = pc_penalty)
+                                pc_weight = pc_weight, pc_penalty = pc_penalty,
+                                depth = child_depth, table = table, sigma_mode = sigma_mode)
         push!(kids, child)
     else
         child = rand(rng, kids)
@@ -520,7 +772,8 @@ function simulate!(pomdp::SpacecraftCAPOMDP, node::BeliefNode, depth::Int,
         # (step_reward reuses it), so this is cheap and consistent with expand.
         r, _, _ = step_reward(pomdp, a, child;
                               constraint_mode = constraint_mode,
-                              pc_weight = pc_weight, pc_penalty = pc_penalty)
+                              pc_weight = pc_weight, pc_penalty = pc_penalty,
+                              depth = child_depth, table = table, sigma_mode = sigma_mode)
     end
 
     q = r + POMDPs.discount(pomdp) * simulate!(pomdp, child, depth - 1, rng;
@@ -528,7 +781,9 @@ function simulate!(pomdp::SpacecraftCAPOMDP, node::BeliefNode, depth::Int,
                                                cadence_debris = cadence_debris,
                                                c = c, k = k, α = α,
                                                constraint_mode = constraint_mode,
-                                               pc_weight = pc_weight, pc_penalty = pc_penalty)
+                                               pc_weight = pc_weight, pc_penalty = pc_penalty,
+                                               node_depth = child_depth,
+                                               table = table, sigma_mode = sigma_mode)
 
     # running-average backup on the per-action value
     node.Na[a] = na + 1
@@ -568,6 +823,7 @@ struct MCTSPlanner
     constraint_mode::Symbol
     pc_weight::Float64
     pc_penalty::Float64
+    sigma_mode::Symbol
 end
 
 function MCTSPlanner(pomdp::SpacecraftCAPOMDP;
@@ -581,11 +837,13 @@ function MCTSPlanner(pomdp::SpacecraftCAPOMDP;
                      cadence_debris::Real = pomdp.cadence_debris,
                      constraint_mode::Symbol = MCTS_CONSTRAINT_MODE,
                      pc_weight::Real = MCTS_PC_REWARD_WEIGHT,
-                     pc_penalty::Real = MCTS_PC_VIOLATION_PENALTY)
+                     pc_penalty::Real = MCTS_PC_VIOLATION_PENALTY,
+                     sigma_mode::Symbol = MCTS_SIGMA_MODE)
     return MCTSPlanner(pomdp, n_iterations, max_depth, Float64(c),
                        Float64(k), Float64(α), Float64(dt),
                        Float64(cadence_sc), Float64(cadence_debris),
-                       constraint_mode, Float64(pc_weight), Float64(pc_penalty))
+                       constraint_mode, Float64(pc_weight), Float64(pc_penalty),
+                       sigma_mode)
 end
 
 """
@@ -597,13 +855,22 @@ tree, including per-node Pc / violation instrumentation) is returned too for
 inspection/testing.
 """
 function plan(planner::MCTSPlanner, root::BeliefNode, rng::AbstractRNG)
+    # Efficiency pass: under :fast, precompute the branch-invariant debris
+    # Σ-at-TCA per depth ONCE (see the FAST Σ PATH section header), then look it
+    # up per node instead of re-propagating the debris covariance every node.
+    table = planner.sigma_mode == :fast ?
+            build_sigma_tca_table(planner.pomdp, root; dt = planner.dt,
+                                  cadence_sc = planner.cadence_sc,
+                                  cadence_debris = planner.cadence_debris,
+                                  max_depth = planner.max_depth) : nothing
     for _ in 1:planner.n_iterations
         simulate!(planner.pomdp, root, planner.max_depth, rng;
                   dt = planner.dt, cadence_sc = planner.cadence_sc,
                   cadence_debris = planner.cadence_debris,
                   c = planner.c, k = planner.k, α = planner.α,
                   constraint_mode = planner.constraint_mode,
-                  pc_weight = planner.pc_weight, pc_penalty = planner.pc_penalty)
+                  pc_weight = planner.pc_weight, pc_penalty = planner.pc_penalty,
+                  node_depth = 0, table = table, sigma_mode = planner.sigma_mode)
     end
     acts = POMDPs.actions(planner.pomdp)
     best_a = acts[1]

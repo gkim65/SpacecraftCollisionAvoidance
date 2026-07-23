@@ -32,6 +32,13 @@ the per-step constraint instead of the retired miss-distance placeholder:
 10. END-TO-END (Phase 6): on a real cross-track conjunction the planner drives
     Pc down / prefers the action that lowers Pc, and the constraint prunes /
     penalizes branches (the ablation: :off vs :penalize vs :terminate differ).
+11. ASYMMETRIC CADENCE (measurement realism): the sat (GPS, ~2 h) and debris
+    (TLE, ~8 h) get corrected on different schedules; predict-only steps grow Σ,
+    fix steps shrink it relative to the same step's predict-only counterpart.
+12. FAST Σ PATH (efficiency pass): the precompute-per-depth debris Σ table
+    reproduces the exact per-node debris Σ-at-TCA, and sigma_mode = :fast gives a
+    Pc (and an end-to-end action + tree) identical to :exact — the fast path
+    introduces NO approximation (debris Σ branch-invariant, sat propagated exact).
 
 Run:  julia --project=. src/tests/test_belief_mcts.jl
 =#
@@ -490,6 +497,82 @@ end
         cn, _ = expand_child(pomdp_nofix, root_nofix, WAIT, MersenneTwister(0); dt = pomdp_nofix.dt)
         @test cn.since_debris > 0.0                                 # confirm NO debris fix
         @test cs.belief.debris.Σ[1, 1] < cn.belief.debris.Σ[1, 1]   # fix shrank Σ vs. predict-only
+    end
+
+    # -----------------------------------------------------------------
+    @testset "12. Fast Σ path (efficiency pass) == exact per-node path" begin
+        # The efficiency pass precomputes the branch-invariant DEBRIS Σ-at-TCA per
+        # depth ONCE (build_sigma_tca_table) and looks it up per node, propagating
+        # only the debris MEAN + the full satellite belief per node (sigma_mode =
+        # :fast). Because the debris Σ is bitwise branch-invariant and the sat is
+        # propagated exactly, the fast path's Pc must EQUAL the exact per-node path
+        # (node_pc_at_tca / sigma_mode = :exact) — NO approximation. This is the
+        # correctness assertion that lets :fast be the default while :exact stays
+        # the oracle (and the only valid mode once Phase 8 adds maneuver noise).
+        pomdp = SpacecraftCAPOMDP(seed = 42, randAdd = false, dt = 60 * 60,
+                                  TCA_max = 8 * 60 * 60, Δv = 5.0)
+        s0 = make_conjunction_state(pomdp; miss_m = 200.0, v_rel = 15.0,
+                                    geometry = :cross_track, t = 8 * 60 * 60)
+        root = root_from_pomdp(pomdp, s0)
+        max_d = 7
+        table = build_sigma_tca_table(pomdp, root; dt = pomdp.dt, max_depth = max_d)
+
+        # (a) The precomputed per-depth DEBRIS Σ-at-TCA reproduces a fresh per-node
+        #     propagation of the SAME (branch-invariant) belief EXACTLY, on BOTH a
+        #     WAIT and a MANEUVER spine (debris Σ is maneuver-/z-independent).
+        function spine(first_action)
+            node = root_from_pomdp(pomdp, s0)
+            chain = [(0, node)]
+            a = first_action
+            for d in 1:max_d
+                node, _ = expand_child(pomdp, node, a, MersenneTwister(50 + d);
+                                       dt = pomdp.dt, sigma_mode = :exact)
+                push!(chain, (d, node))
+                a = WAIT
+            end
+            return chain
+        end
+
+        for first_action in (WAIT, MANEUVER)
+            for (d, node) in spine(first_action)
+                # exact debris Σ-at-TCA for THIS node's belief
+                _, Σdb_exact = _grow_belief_to_tca(pomdp, node.belief.debris.μ,
+                                                   node.belief.debris.Σ,
+                                                   pomdp.debrisParams, node.belief.t)
+                # the table entry (built along the WAIT reference) must match it
+                @test table.Σ_db[d + 1] ≈ Σdb_exact rtol = 1e-12
+
+                # full Pc: fast == exact to roundoff
+                node.pc = NaN
+                pc_exact = node_pc(pomdp, node; sigma_mode = :exact)
+                node.pc = NaN
+                pc_fast = node_pc(pomdp, node; depth = d, table = table, sigma_mode = :fast)
+                @test pc_fast ≈ pc_exact rtol = 1e-10
+            end
+        end
+
+        # (b) A depth beyond the table falls back to the exact path (no crash).
+        deep = spine(WAIT)[end][2]
+        deep.pc = NaN
+        @test node_pc(pomdp, deep; depth = max_d + 5, table = table, sigma_mode = :fast) ≈
+              node_pc_at_tca(pomdp, deep) rtol = 1e-10
+
+        # (c) End-to-end: :fast and :exact planners produce the SAME action and a
+        #     bitwise-identical tree under the same seed (fast is exact, and the
+        #     RNG stream is untouched by the Σ mode).
+        nsteps = max_d
+        rf = root_from_pomdp(pomdp, s0)
+        re = root_from_pomdp(pomdp, s0)
+        pf = MCTSPlanner(pomdp; n_iterations = 20, max_depth = nsteps, dt = pomdp.dt,
+                         sigma_mode = :fast)
+        pe = MCTSPlanner(pomdp; n_iterations = 20, max_depth = nsteps, dt = pomdp.dt,
+                         sigma_mode = :exact)
+        af, _ = plan(pf, rf, MersenneTwister(7))
+        ae, _ = plan(pe, re, MersenneTwister(7))
+        @test af == ae
+        for a in POMDPs.actions(pomdp)
+            @test get(rf.Qa, a, NaN) ≈ get(re.Qa, a, NaN) rtol = 1e-9
+        end
     end
 
 end
