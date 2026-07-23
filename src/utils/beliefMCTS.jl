@@ -88,6 +88,7 @@
 
 using LinearAlgebra
 using Random
+using Distributed
 
 # --- search tuning constants (see CONSTANTS.md) --------------------------------
 # Widening / budget knobs keep POMCPOW's published defaults (Phase 5).
@@ -124,6 +125,18 @@ const MCTS_CONSTRAINT_MODE     = :penalize   # :penalize | :terminate | :off
 #            The correctness oracle; the ONLY valid mode once Phase 8 adds
 #            maneuver noise. See node_pc_at_tca / the FAST Σ PATH section header.
 const MCTS_SIGMA_MODE = :fast
+
+# --- root-parallel MCTS knobs (efficiency pass, 2026-07-23) --------------------
+# Multiprocess root parallelization: split the simulation budget across N Julia
+# WORKER PROCESSES (Distributed), each with its OWN Python/brahe interpreter, then
+# merge the per-action visit counts + Q (Na-weighted running-average combine). See
+# the ROOT-PARALLEL MCTS section header for the why (PyCall's GIL rules out
+# in-process threading) and the soundness argument for pick-best-by-Q.
+#   MCTS_PARALLEL   — default on/off for the parallel path (serial when false).
+#   MCTS_N_WORKERS  — how many worker processes to split the budget across when on;
+#                     `nothing` ⇒ use all currently-attached Distributed workers.
+const MCTS_PARALLEL  = false
+const MCTS_N_WORKERS = nothing
 
 # =========================================================================
 # Tree node.  Reuses Phase 4's `Belief` (two 6×6 sub-beliefs + time-remaining)
@@ -824,6 +837,8 @@ struct MCTSPlanner
     pc_weight::Float64
     pc_penalty::Float64
     sigma_mode::Symbol
+    parallel::Bool
+    n_workers::Union{Int,Nothing}
 end
 
 function MCTSPlanner(pomdp::SpacecraftCAPOMDP;
@@ -838,32 +853,40 @@ function MCTSPlanner(pomdp::SpacecraftCAPOMDP;
                      constraint_mode::Symbol = MCTS_CONSTRAINT_MODE,
                      pc_weight::Real = MCTS_PC_REWARD_WEIGHT,
                      pc_penalty::Real = MCTS_PC_VIOLATION_PENALTY,
-                     sigma_mode::Symbol = MCTS_SIGMA_MODE)
+                     sigma_mode::Symbol = MCTS_SIGMA_MODE,
+                     parallel::Bool = MCTS_PARALLEL,
+                     n_workers::Union{Int,Nothing} = MCTS_N_WORKERS)
     return MCTSPlanner(pomdp, n_iterations, max_depth, Float64(c),
                        Float64(k), Float64(α), Float64(dt),
                        Float64(cadence_sc), Float64(cadence_debris),
                        constraint_mode, Float64(pc_weight), Float64(pc_penalty),
-                       sigma_mode)
+                       sigma_mode, parallel, n_workers)
 end
 
 """
-    plan(planner, root::BeliefNode, rng) -> (best_action, root)
+    run_sims!(planner, root, rng; n_iterations=planner.n_iterations, table=<built>)
+        -> (root, table)
 
-Run the planner's simulations from `root` and return the best action by
-per-action value `Qa`. The mutated `root` (with visit/value stats and the built
-tree, including per-node Pc / violation instrumentation) is returned too for
-inspection/testing.
+Run `n_iterations` MCTS simulations from `root` (building the fast Σ table once if
+`sigma_mode == :fast` and none is supplied), mutating `root` in place. This is the
+serial search kernel shared by the single-process `plan` and by each worker of the
+root-parallel path — factoring it out keeps the two paths bit-for-bit identical
+given the same `rng` state and iteration count. Returns the mutated `root` and the
+Σ table used (so a caller can reuse or ship it).
 """
-function plan(planner::MCTSPlanner, root::BeliefNode, rng::AbstractRNG)
+function run_sims!(planner::MCTSPlanner, root::BeliefNode, rng::AbstractRNG;
+                   n_iterations::Int = planner.n_iterations,
+                   table::Union{SigmaTCATable,Nothing} = nothing)
     # Efficiency pass: under :fast, precompute the branch-invariant debris
     # Σ-at-TCA per depth ONCE (see the FAST Σ PATH section header), then look it
     # up per node instead of re-propagating the debris covariance every node.
-    table = planner.sigma_mode == :fast ?
-            build_sigma_tca_table(planner.pomdp, root; dt = planner.dt,
-                                  cadence_sc = planner.cadence_sc,
-                                  cadence_debris = planner.cadence_debris,
-                                  max_depth = planner.max_depth) : nothing
-    for _ in 1:planner.n_iterations
+    if table === nothing && planner.sigma_mode == :fast
+        table = build_sigma_tca_table(planner.pomdp, root; dt = planner.dt,
+                                      cadence_sc = planner.cadence_sc,
+                                      cadence_debris = planner.cadence_debris,
+                                      max_depth = planner.max_depth)
+    end
+    for _ in 1:n_iterations
         simulate!(planner.pomdp, root, planner.max_depth, rng;
                   dt = planner.dt, cadence_sc = planner.cadence_sc,
                   cadence_debris = planner.cadence_debris,
@@ -872,17 +895,234 @@ function plan(planner::MCTSPlanner, root::BeliefNode, rng::AbstractRNG)
                   pc_weight = planner.pc_weight, pc_penalty = planner.pc_penalty,
                   node_depth = 0, table = table, sigma_mode = planner.sigma_mode)
     end
-    acts = POMDPs.actions(planner.pomdp)
-    best_a = acts[1]
+    return root, table
+end
+
+"""
+    best_action_by_q(actions, Qa) -> best_action
+
+Pick the action with the highest per-action value `Qa` (the MCTS decision rule).
+An action absent from `Qa` scores `-Inf`. Shared by the serial and merged
+(root-parallel) decisions so both decide identically from a `Qa` dict.
+"""
+function best_action_by_q(actions::AbstractVector{CAAction}, Qa::AbstractDict)
+    best_a = actions[1]
     best_q = -Inf
-    for a in acts
-        q = get(root.Qa, a, -Inf)
+    for a in actions
+        q = get(Qa, a, -Inf)
         if q > best_q
             best_q = q
             best_a = a
         end
     end
-    return best_a, root
+    return best_a
+end
+
+"""
+    plan(planner, root::BeliefNode, rng) -> (best_action, root)
+
+Run the planner's simulations from `root` and return the best action by
+per-action value `Qa`. The mutated `root` (with visit/value stats and the built
+tree, including per-node Pc / violation instrumentation) is returned too for
+inspection/testing. When `planner.parallel` is set, dispatches to the
+root-parallel multiprocess path (`plan_parallel`) instead — see that function and
+the ROOT-PARALLEL MCTS section header. `rng` must be seeded by the caller for a
+reproducible result (the parallel path derives its per-worker substreams from it).
+"""
+function plan(planner::MCTSPlanner, root::BeliefNode, rng::AbstractRNG)
+    if planner.parallel
+        return plan_parallel(planner, root, rng)
+    end
+    run_sims!(planner, root, rng)
+    return best_action_by_q(POMDPs.actions(planner.pomdp), root.Qa), root
+end
+
+# =========================================================================
+# ROOT-PARALLEL MCTS (multiprocess; efficiency pass, 2026-07-23)
+#
+# WHY MULTIPROCESS, NOT THREADS: ~95% of per-node cost is the brahe propagation,
+# which runs through PyCall and holds the Python GIL — in-process @threads
+# SERIALIZE at the brahe call (no speedup) and multi-thread PyCall is not reliably
+# safe (segfault/corruption; the from_orbits port hit this). So we split the
+# simulation budget across N Julia WORKER PROCESSES (Distributed), each with its
+# OWN Python/brahe interpreter (get_brahe() lazy-inits one per process — no GIL
+# contention, PyCall stays single-threaded per worker).
+#
+# ROOT PARALLELIZATION (the standard, sound-for-pick-best-by-Q scheme): every
+# worker builds an INDEPENDENT tree from a COPY of the same root, runs its share of
+# the budget (n_iterations split as evenly as possible), and reports its per-action
+# visit counts Na and values Qa. We then MERGE across workers with an Na-WEIGHTED
+# running-average of Q (`merge_action_stats`) — i.e. the merged Q(a) is the same
+# number a single serial run of the combined budget would converge to for that
+# action's mean return, so picking argmax_a Q(a) on the merge is the intended
+# decision. (Root parallelization is only valid for the ROOT decision — it does not
+# share sub-tree statistics, which is exactly what we want here: we only need the
+# top-level action.)
+#
+# DETERMINISM: a fixed master seed must give a reproducible MERGED result regardless
+# of which worker runs which chunk or in what order they finish. We achieve this by
+# deriving a DISTINCT, WORKER-INDEXED substream seed from the master seed
+# (`worker_seeds`) — chunk i always uses the same seed and the same iteration count,
+# so its (Na, Qa) is fixed; and the Na-weighted merge is order-independent when
+# combined pairwise from a fixed chunk ordering (we fold chunks in index order, not
+# completion order). Result: same master seed + same chunking ⇒ identical merged Qa
+# and identical decision, run to run.
+#
+# ⚠️ REQUIRES WORKERS THAT HAVE LOADED THIS CODE. The caller must have added
+# Distributed workers and `@everywhere include(...)`d the project (so each worker
+# has SpacecraftCAPOMDP + beliefMCTS + can build its own brahe). If no extra workers
+# are attached, `plan_parallel` runs the whole budget locally (still correct, just
+# not parallel) and says so. The once-per-plan Σ table is built ONCE on the
+# coordinator and shipped to the workers (it is deterministic in the root, so this
+# only saves recompute — it does not change results).
+# =========================================================================
+
+"""
+    worker_seeds(master_seed, n_chunks) -> Vector{UInt}
+
+Derive `n_chunks` distinct, reproducible per-chunk RNG seeds from a single
+`master_seed`. Chunk `i` always gets the same seed for a given `master_seed`, so
+the parallel search is reproducible regardless of worker assignment or completion
+order. Uses a `MersenneTwister(master_seed)`-driven draw of independent `UInt`
+seeds (a simple, adequate substream scheme for independent trees — each chunk then
+seeds its own `MersenneTwister`).
+"""
+function worker_seeds(master_seed::Integer, n_chunks::Int)
+    seed_rng = MersenneTwister(UInt(master_seed))
+    return UInt[rand(seed_rng, UInt) for _ in 1:n_chunks]
+end
+
+"""
+    split_iterations(n_iterations, n_chunks) -> Vector{Int}
+
+Split `n_iterations` across `n_chunks` as evenly as possible (the first
+`n_iterations % n_chunks` chunks get one extra). Deterministic in the inputs, so
+the per-chunk budget — and hence each chunk's result — is fixed run to run.
+"""
+function split_iterations(n_iterations::Int, n_chunks::Int)
+    n_chunks <= 1 && return [n_iterations]
+    base = div(n_iterations, n_chunks)
+    rem  = mod(n_iterations, n_chunks)
+    return [base + (i <= rem ? 1 : 0) for i in 1:n_chunks]
+end
+
+"""
+    merge_action_stats(stats) -> (Na_total, Qa_merged)
+
+Merge a vector of per-chunk `(Na, Qa)` action-statistics into a single set, using
+the Na-WEIGHTED running-average combine (standard root-parallel MCTS): for each
+action `a`,
+    Na_total(a) = Σ_i Na_i(a)
+    Qa_merged(a) = ( Σ_i Na_i(a) · Qa_i(a) ) / Na_total(a)
+i.e. the visit-count-weighted mean of the per-chunk Q's, which equals the mean
+return a single serial run of the combined budget would have accumulated for that
+action. Chunks are folded in the given (fixed, index) order so the result is
+order-independent and reproducible. Actions with zero total visits are omitted
+(they carry no value estimate), matching a serial run that never took them.
+"""
+function merge_action_stats(stats::AbstractVector)
+    Na_total = Dict{CAAction,Int}()
+    num      = Dict{CAAction,Float64}()   # Σ Na·Q accumulator per action
+    for (Na, Qa) in stats
+        for (a, na) in Na
+            na == 0 && continue
+            Na_total[a] = get(Na_total, a, 0) + na
+            num[a]      = get(num, a, 0.0) + na * Qa[a]
+        end
+    end
+    Qa_merged = Dict{CAAction,Float64}()
+    for (a, na) in Na_total
+        Qa_merged[a] = num[a] / na
+    end
+    return Na_total, Qa_merged
+end
+
+"""
+    _run_chunk(planner, root, n_iter, seed, table) -> (Na, Qa)
+
+Run one worker's share of the budget: `deepcopy` the root (so the worker mutates
+its OWN independent tree — critical when this runs on a remote process, and
+harmless locally), seed a fresh `MersenneTwister(seed)`, run `n_iter` sims via the
+shared `run_sims!` kernel, and return only the root's per-action `(Na, Qa)` (the
+merge needs nothing else, and small dicts serialize cheaply back to the
+coordinator). The `table` is built once on the coordinator and passed in.
+"""
+function _run_chunk(planner::MCTSPlanner, root::BeliefNode, n_iter::Int,
+                    seed::UInt, table::Union{SigmaTCATable,Nothing})
+    local_root = deepcopy(root)
+    rng = MersenneTwister(seed)
+    run_sims!(planner, local_root, rng; n_iterations = n_iter, table = table)
+    return (copy(local_root.Na), copy(local_root.Qa))
+end
+
+"""
+    plan_parallel(planner, root, rng) -> (best_action, root)
+
+Root-parallel multiprocess `plan` (see the ROOT-PARALLEL MCTS section header). Uses
+`rng` only to draw a master seed, from which per-chunk substream seeds are derived
+(`worker_seeds`) so the merged result is reproducible under a fixed input `rng`.
+Splits `n_iterations` across the available Distributed workers (or `planner.
+n_workers` if set, capped at the workers actually attached), builds the fast Σ
+table once on the coordinator, dispatches one chunk per worker with `remotecall`,
+merges the returned per-action `(Na, Qa)` with the Na-weighted combine, writes the
+merged stats back onto `root`, and returns the best action by merged Q.
+
+Falls back to running the whole budget locally (still correct) when no extra
+workers are attached — so the flag can be flipped on without a Distributed cluster
+and simply not parallelize.
+"""
+function plan_parallel(planner::MCTSPlanner, root::BeliefNode, rng::AbstractRNG)
+    master_seed = rand(rng, UInt)
+
+    # available worker processes (procs other than the coordinator). If the caller
+    # capped n_workers, honor it but never exceed the workers actually attached.
+    avail = workers()
+    have_workers = !(length(avail) == 1 && avail[1] == myid())   # workers() is [1] when none added
+    pool = have_workers ? avail : Int[]
+    n_pool = length(pool)
+    n_chunks = planner.n_workers === nothing ? max(n_pool, 1) :
+               (n_pool == 0 ? 1 : min(planner.n_workers, n_pool))
+    n_chunks = max(n_chunks, 1)
+
+    seeds  = worker_seeds(master_seed, n_chunks)
+    iters  = split_iterations(planner.n_iterations, n_chunks)
+
+    # Build the deterministic Σ table ONCE on the coordinator and ship it to the
+    # workers (it is a pure function of the root, so this only avoids recompute).
+    table = planner.sigma_mode == :fast ?
+            build_sigma_tca_table(planner.pomdp, root; dt = planner.dt,
+                                  cadence_sc = planner.cadence_sc,
+                                  cadence_debris = planner.cadence_debris,
+                                  max_depth = planner.max_depth) : nothing
+
+    local stats::Vector{Any}
+    if n_pool == 0
+        # No cluster attached: run every chunk locally, in fixed index order. Still
+        # reproducible and correct — just not parallel.
+        stats = [_run_chunk(planner, root, iters[i], seeds[i], table)
+                 for i in 1:n_chunks]
+    else
+        # One chunk per worker (round-robin if more chunks than workers). Dispatch
+        # all, then collect in FIXED index order (not completion order) so the merge
+        # is reproducible regardless of which worker finishes first.
+        futures = Vector{Future}(undef, n_chunks)
+        for i in 1:n_chunks
+            w = pool[mod1(i, n_pool)]
+            futures[i] = remotecall(_run_chunk, w, planner, root,
+                                    iters[i], seeds[i], table)
+        end
+        stats = [fetch(futures[i]) for i in 1:n_chunks]
+    end
+
+    Na_total, Qa_merged = merge_action_stats(stats)
+    # Write the merged decision statistics back onto the passed root so callers /
+    # tests can inspect them exactly as with a serial plan. (The per-node tree
+    # itself lives on the worker copies and is intentionally not merged — root
+    # parallelization shares only the top-level action statistics.)
+    root.Na = Na_total
+    root.Qa = Qa_merged
+    root.N  = sum(values(Na_total); init = 0)
+    return best_action_by_q(POMDPs.actions(planner.pomdp), Qa_merged), root
 end
 
 """

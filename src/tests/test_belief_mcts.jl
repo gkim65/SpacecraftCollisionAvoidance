@@ -39,6 +39,11 @@ the per-step constraint instead of the retired miss-distance placeholder:
     reproduces the exact per-node debris Σ-at-TCA, and sigma_mode = :fast gives a
     Pc (and an end-to-end action + tree) identical to :exact — the fast path
     introduces NO approximation (debris Σ branch-invariant, sat propagated exact).
+13. ROOT-PARALLEL MCTS (efficiency pass): the split/seed/Na-weighted-Q-merge
+    helpers are arithmetically correct; the local-fallback parallel plan is
+    reproducible under a fixed master seed and picks the same action as a serial
+    plan; and a real 2-worker multiprocess plan is reproducible under a fixed
+    master seed (same merged Qa, run to run) and agrees with serial on the action.
 
 Run:  julia --project=. src/tests/test_belief_mcts.jl
 =#
@@ -49,6 +54,7 @@ using Random
 using PyCall
 using POMDPs        # SpacecraftCAPOMDP.jl subtypes POMDP{...}
 using POMDPTools
+using Distributed   # group 13: root-parallel MCTS (multiprocess)
 
 include(joinpath(@__DIR__, "..", "SpacecraftCAPOMDP.jl"))
 include(joinpath(@__DIR__, "..", "utils", "genConjunctions.jl"))
@@ -572,6 +578,89 @@ end
         @test af == ae
         for a in POMDPs.actions(pomdp)
             @test get(rf.Qa, a, NaN) ≈ get(re.Qa, a, NaN) rtol = 1e-9
+        end
+    end
+
+    # -----------------------------------------------------------------
+    @testset "13. Root-parallel MCTS (multiprocess)" begin
+        pomdp = SpacecraftCAPOMDP(seed = 42, randAdd = false)
+        nsteps = 3
+        s0 = make_conjunction_state(pomdp; t = nsteps * pomdp.dt)
+
+        # (a) Pure combinators: budget split, seeds, and the Na-weighted Q merge.
+        @test split_iterations(10, 3) == [4, 3, 3]      # remainder front-loaded
+        @test split_iterations(9, 3)  == [3, 3, 3]
+        @test sum(split_iterations(1000, 7)) == 1000     # budget conserved
+        @test split_iterations(40, 1) == [40]            # single chunk = whole budget
+        # deterministic + distinct per-chunk seeds from one master seed
+        @test worker_seeds(123, 4) == worker_seeds(123, 4)
+        @test length(unique(worker_seeds(123, 4))) == 4
+        @test worker_seeds(123, 4) != worker_seeds(124, 4)
+        # Na-weighted running-average combine: Q(a) = Σ Na·Q / Σ Na, Na summed.
+        Na1 = Dict(WAIT => 4, MANEUVER => 2); Qa1 = Dict(WAIT => -1.0, MANEUVER => -3.0)
+        Na2 = Dict(WAIT => 6, MANEUVER => 0); Qa2 = Dict(WAIT => -2.0)
+        Nt, Qm = merge_action_stats([(Na1, Qa1), (Na2, Qa2)])
+        @test Nt[WAIT] == 10 && Nt[MANEUVER] == 2
+        @test Qm[WAIT] ≈ (4 * -1.0 + 6 * -2.0) / 10       # = -1.6
+        @test Qm[MANEUVER] ≈ -3.0                          # only chunk 1 visited it
+        # an action never visited by ANY chunk carries no value ⇒ omitted from the merge
+        Nt0, _ = merge_action_stats([(Dict(WAIT => 5), Dict(WAIT => -1.0)),
+                                     (Dict(WAIT => 5), Dict(WAIT => -1.0))])
+        @test haskey(Nt0, WAIT) && !haskey(Nt0, MANEUVER)
+
+        # (b) Local-fallback parallel plan: `parallel = true` with NO extra workers
+        #     attached yet runs the whole budget locally (still through the merge
+        #     path). Must be reproducible under a fixed master seed and pick the same
+        #     ACTION as a serial plan (the merged decision matches serial in
+        #     distribution). Runs before (c) adds any procs, so n_pool == 0 here.
+        pser = MCTSPlanner(pomdp; n_iterations = 40, max_depth = nsteps, dt = pomdp.dt,
+                           parallel = false)
+        rser = root_from_pomdp(pomdp, s0)
+        aser, _ = plan(pser, rser, MersenneTwister(123))
+
+        ppar = MCTSPlanner(pomdp; n_iterations = 40, max_depth = nsteps, dt = pomdp.dt,
+                           parallel = true)
+        rp1 = root_from_pomdp(pomdp, s0); a_p1, _ = plan(ppar, rp1, MersenneTwister(123))
+        rp2 = root_from_pomdp(pomdp, s0); a_p2, _ = plan(ppar, rp2, MersenneTwister(123))
+        @test a_p1 == a_p2                                 # determinism (fixed master seed)
+        @test rp1.Qa == rp2.Qa                             # merged Qa bitwise identical
+        @test rp1.Na == rp2.Na
+        @test rp1.N == sum(values(rp1.Na))                 # visits conserved through merge
+        @test a_p1 == aser                                 # same action as serial (distributional)
+
+        # (c) Real multiprocess: 2 worker processes, each its OWN brahe interpreter.
+        #     Skips cleanly if procs can't be added (CI without the venv reachable).
+        srcdir = joinpath(@__DIR__, "..")
+        added = Int[]
+        try
+            added = addprocs(2)
+            @everywhere added begin
+                using LinearAlgebra, Random, PyCall, POMDPs, POMDPTools
+                let d = $srcdir
+                    include(joinpath(d, "SpacecraftCAPOMDP.jl"))
+                    include(joinpath(d, "utils", "genConjunctions.jl"))
+                    include(joinpath(d, "utils", "computePc.jl"))
+                    include(joinpath(d, "utils", "covarianceTable.jl"))
+                    include(joinpath(d, "states.jl"))
+                    include(joinpath(d, "actions.jl"))
+                    include(joinpath(d, "rewards.jl"))
+                    include(joinpath(d, "observations.jl"))
+                    include(joinpath(d, "transitions.jl"))
+                    include(joinpath(d, "utils", "beliefTracker.jl"))
+                    include(joinpath(d, "utils", "beliefMCTS.jl"))
+                end
+            end
+
+            pmp = MCTSPlanner(pomdp; n_iterations = 40, max_depth = nsteps, dt = pomdp.dt,
+                              parallel = true)
+            rm1 = root_from_pomdp(pomdp, s0); am1, _ = plan(pmp, rm1, MersenneTwister(123))
+            rm2 = root_from_pomdp(pomdp, s0); am2, _ = plan(pmp, rm2, MersenneTwister(123))
+            @test am1 == am2                               # reproducible across real workers
+            @test rm1.Qa == rm2.Qa                         # merged Qa identical, run to run
+            @test rm1.Na == rm2.Na
+            @test am1 == aser                              # agrees with serial on the action
+        finally
+            isempty(added) || rmprocs(added)
         end
     end
 

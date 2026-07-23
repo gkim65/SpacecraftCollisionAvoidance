@@ -357,7 +357,7 @@ a **per-step chance-constraint check** (architecture §4 steps 5–6, §7):
 julia --project=. src/tests/test_belief_mcts.jl
 ```
 
-100 checks in 12 groups: the five Phase-5 mechanics groups above (**UCB
+120 checks in 13 groups: the five Phase-5 mechanics groups above (**UCB
 selection**, **backup arithmetic**, **progressive widening**, **tree health**,
 **determinism**); five Phase-6 groups — **Pc-at-TCA from a node** (finite, in
 [0,1], matches a direct `chan_pc` on the mean + the node's accumulated Σ propagated
@@ -371,14 +371,46 @@ the maneuver that lowers Pc-at-TCA, and `:terminate` prunes more violating nodes
 than `:penalize`; the **asymmetric measurement cadence** group (below); and the
 **fast Σ path** group — the per-depth debris Σ table reproduces the exact per-node
 debris Σ-at-TCA, and `sigma_mode = :fast` yields a Pc (and an end-to-end action +
-tree) identical to `:exact`.
+tree) identical to `:exact`; and the **root-parallel MCTS** group — the
+budget-split / seed / Na-weighted-Q-merge helpers are arithmetically correct, the
+local-fallback parallel plan is reproducible under a fixed master seed and picks
+the same action as serial, and a real 2-worker multiprocess plan (each worker its
+own Brahe interpreter) is reproducible under a fixed master seed and agrees with
+serial on the action.
 
 Same Brahe-only dependency as the other tests. Note: Pc evaluation is the search
 bottleneck (Brahe numerical propagations). The `:fast` `sigma_mode` (default,
 above) cuts it to ~1.85× less per node by tabling the branch-invariant debris Σ,
-but a `plan` over a multi-hour window is still minutes: the next efficiency lever
-is **multiprocess root-parallel search** (one Brahe interpreter per worker
-process — PyCall's GIL rules out in-process threading), deferred to its own task.
+and the **root-parallel search** (below) fans the simulation budget across worker
+processes on top of that.
+
+- `parallel` / `n_workers` (planner args, **efficiency pass**): with
+  `parallel = true` the planner splits the `n_iterations` budget across Julia
+  **worker processes** (`Distributed`), each with its **own Python/Brahe
+  interpreter**, running an independent tree from a copy of the root; the
+  per-action visit counts and `Q` are then merged with an **Na-weighted
+  running-average** combine (standard root-parallel MCTS — sound for the
+  pick-best-by-`Q` root decision). Multiprocess rather than threads because
+  ~95% of cost is the Brahe propagation, which holds **PyCall's GIL** (in-process
+  `@threads` serialize there and multi-thread PyCall is unsafe). A fixed master
+  RNG gives a **reproducible merged result** (per-worker substream seeds via
+  `worker_seeds`, fixed-order merge). Off by default; with no extra workers
+  attached it runs the whole budget locally (correct, not parallel). To use it,
+  add workers and load the project on each first:
+
+  ```julia
+  using Distributed
+  addprocs(6)                                   # one process per core to use
+  @everywhere include("src/SpacecraftCollisionAvoidance.jl")   # + its deps; each worker builds its own Brahe
+  planner = MCTSPlanner(pomdp; parallel = true) # n_workers = nothing ⇒ all attached workers
+  best_a, root = plan(planner, root, MersenneTwister(seed))
+  ```
+
+  Measured (12-core machine, 6-step / 60-sim window, on top of `:fast`):
+  1.69× on 2 workers, 2.81× on 4, 3.56× on 6 — sub-linear on this short window
+  because the once-per-plan Σ-table build and the serial merge run on the
+  coordinator regardless of worker count (Amdahl); scaling approaches linear on
+  the full 24-step window where the parallel search dominates.
 
 ### Asymmetric measurement realism — sourced noise + per-object cadence
 
