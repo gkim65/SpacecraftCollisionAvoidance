@@ -7,6 +7,7 @@ using LinearAlgebra
 
 
 include("SpacecraftCAPOMDP.jl")
+include("utils/sensorTiers.jl")
 include("utils/genConjunctions.jl")
 include("utils/computePc.jl")
 include("utils/covarianceTable.jl")

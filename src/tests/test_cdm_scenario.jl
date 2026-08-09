@@ -34,6 +34,7 @@ using POMDPTools
 using Distributions
 
 include(joinpath(@__DIR__, "..", "SpacecraftCAPOMDP.jl"))
+include(joinpath(@__DIR__, "..", "utils", "sensorTiers.jl"))
 include(joinpath(@__DIR__, "..", "utils", "genConjunctions.jl"))
 include(joinpath(@__DIR__, "..", "utils", "computePc.jl"))
 include(joinpath(@__DIR__, "..", "utils", "covarianceTable.jl"))
@@ -92,6 +93,37 @@ _pd(A) = (try; cholesky(Symmetric(Matrix(A))); true; catch; false; end)
         @test isapprox(sc.t_horizon / 3600, 33.1; atol = 0.1)
         @test sc.b0.t == sc.t_horizon
         @test sc.s_true.t == sc.t_horizon
+    end
+
+    @testset "1b. class-tiered anisotropic sensor R (audit C1)" begin
+        _possig(R) = sort(sqrt.(eigvals(Symmetric(Matrix(R)[1:3, 1:3]))))
+
+        # The primary is the own asset → GPS-grade isotropic R (10 m on all pos
+        # axes), cadence continuous (= dt).
+        @test _possig(sc.pomdp.R_sc) ≈ [10.0, 10.0, 10.0] atol = 1e-6
+        @test sc.pomdp.cadence_sc == sc.pomdp.dt
+
+        # SWIFT/JILIN secondary is a PAYLOAD → GPS-grade isotropic R, 2 h cadence.
+        @test sc.sec_class == :payload
+        @test _possig(sc.pomdp.R_debris) ≈ [10.0, 10.0, 10.0] atol = 1e-6
+        @test sc.pomdp.cadence_debris == 2 * 60 * 60.0
+
+        # Forcing the secondary to DEBRIS gives the anisotropic SSN-radar R:
+        # one tight (range→radial) axis < 100 m, two loose (angular) axes > 100 m,
+        # and an 8 h SSN/TLE cadence — the class routing actually switches R.
+        sc_deb = load_cdm_scenario(JILIN_CDM; sec_class_override = :debris)
+        σd = _possig(sc_deb.pomdp.R_debris)
+        @test σd[1] < 100.0            # radial (range) tight
+        @test σd[3] > 100.0            # cross-range (angular) loose
+        @test σd[3] / σd[1] > 5.0      # clearly anisotropic
+        @test sc_deb.pomdp.cadence_debris == 8 * 60 * 60.0
+        # primary R is unchanged by the secondary's class
+        @test _possig(sc_deb.pomdp.R_sc) ≈ [10.0, 10.0, 10.0] atol = 1e-6
+
+        # The measurement-QUALITY knob sweeps the SSN grade: worse grade → looser R.
+        sc_best  = load_cdm_scenario(JILIN_CDM; sec_class_override = :debris, sensor_quality = :best)
+        sc_worst = load_cdm_scenario(JILIN_CDM; sec_class_override = :debris, sensor_quality = :worst)
+        @test maximum(_possig(sc_best.pomdp.R_debris)) < maximum(_possig(sc_worst.pomdp.R_debris))
     end
 
     @testset "2. belief anchoring (backprop default vs near-TCA)" begin

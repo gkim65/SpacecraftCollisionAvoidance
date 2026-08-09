@@ -59,8 +59,17 @@ struct SpacecraftCAPOMDP <: POMDP{CAState, CAAction, Vector{Float64}}  # POMDP{S
     maneuver_cost::Float64
     P0_sc::Matrix{Float64}      # initial spacecraft covariance
     P0_debris::Matrix{Float64}  # initial debris covariance
-    σ_sc::Float64      # spacecraft measurement noise std (m, m/s)
-    σ_debris::Float64  # debris measurement noise std (m, m/s)
+    σ_sc::Float64      # spacecraft measurement noise std (m, m/s) — legacy isotropic scale
+    σ_debris::Float64  # debris measurement noise std (m, m/s) — legacy isotropic scale
+    # Full 6×6 measurement-noise covariance R per object (ECI, m²/…), the actual
+    # observation noise the linear filter uses. Class-tiered + anisotropic
+    # (src/utils/sensorTiers.jl): the loader sets R_debris from the secondary's
+    # CLASS (SSN-radar anisotropic for debris/RB, GPS-isotropic for payload) and
+    # R_sc to the own-asset GPS grade. Default (unset / synthetic path) = the
+    # legacy isotropic σ²·I₆ so nothing off the CDM path changes. See CONSTANTS.md
+    # "Measurement noise (class-tiered R)".
+    R_sc::Matrix{Float64}
+    R_debris::Matrix{Float64}
     R_hard_body_sc::Float64      # spacecraft hard body radius (m), default 5.0
     R_hard_body_debris::Float64  # debris hard body radius (m), default 15.0
     # SNC (state-noise-compensation) process-noise PSD per RTN axis (m²/s³), one
@@ -108,6 +117,11 @@ function SpacecraftCAPOMDP(;
     # (conservative — SGP4-OD near-epoch radial vel error is ~1-3 cm/s, growing over days).
     σ_sc = 10.0, # own-asset onboard GPS ~1-10 m (Hauschild & Montenbruck 2021); 10 m conservative
     σ_debris = 1000.0, # SSN/TLE ~1 km at OD epoch (Flohrer 2008 / ESA SDC5)
+    # Full 6×6 R per object (ECI). Default `nothing` ⇒ derive the legacy isotropic
+    # σ²·I₆ from the scalars above (synthetic path unchanged). The CDM loader
+    # passes class-tiered anisotropic matrices (src/utils/sensorTiers.jl).
+    R_sc_mat = nothing,
+    R_debris_mat = nothing,
     R_hard_body_sc = 5.0,  # meters, typical spacecraft radius TODO
     R_hard_body_debris = 15.0,  # meters, typical debris radius TODO
     # SNC process-noise PSD per RTN axis (m²/s³). Default = the well-tracked
@@ -136,11 +150,19 @@ function SpacecraftCAPOMDP(;
         M =M * rand() # degrees
         TCA_max = TCA_max + (5*60*60*rand())
     end
+    # Full 6×6 R per object: use the given matrix, else the legacy isotropic σ²·I₆
+    # (so every non-CDM caller is byte-identical to the old scalar model).
+    R_sc_full = R_sc_mat === nothing ? Matrix{Float64}(σ_sc^2 * I, 6, 6) :
+                                       Matrix{Float64}(R_sc_mat)
+    R_db_full = R_debris_mat === nothing ? Matrix{Float64}(σ_debris^2 * I, 6, 6) :
+                                           Matrix{Float64}(R_debris_mat)
 	return SpacecraftCAPOMDP(satParams,debrisParams,epochTCA,forceModel,
                             R_alt,e,i,Ω,ω,M,seed,randAdd,
                             conjunctionType,rMag,vMag,
                             TCA_max, Δv,maneuver_cost,
-                            P0_sc, P0_debris,σ_sc, σ_debris,R_hard_body_sc, R_hard_body_debris,
+                            P0_sc, P0_debris,σ_sc, σ_debris,
+                            R_sc_full, R_db_full,
+                            R_hard_body_sc, R_hard_body_debris,
                             collect(float.(q_rtn_sc)), collect(float.(q_rtn_debris)),
                             pc_threshold, dt,
                             cadence_sc, cadence_debris, correct_at_root, γ)

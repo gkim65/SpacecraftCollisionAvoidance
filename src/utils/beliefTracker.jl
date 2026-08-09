@@ -299,14 +299,15 @@ end
 
 Correct step via the hand-rolled linear-Gaussian update (implementation (a)).
 Splits the 12-vector observation `z` into its spacecraft/debris blocks and
-applies the per-object Kalman update with R = σ²·I from the POMDP (matching
-observations.jl: R_sc = σ_sc²·I₆, R_debris = σ_debris²·I₆). `t` is unchanged
-(a correction does not advance time).
+applies the per-object Kalman update with the POMDP's full 6×6 `R_sc` / `R_debris`
+(class-tiered + anisotropic — sensorTiers.jl; the default synthetic path keeps
+these = σ²·I₆, matching observations.jl). `t` is unchanged (a correction does not
+advance time).
 """
 function correct_linear(pomdp::SpacecraftCAPOMDP, b::Belief, z::AbstractVector;
                         sc_range = 1:6, debris_range = 7:12)
-    R_sc = Matrix{Float64}(pomdp.σ_sc^2 * I, 6, 6)
-    R_db = Matrix{Float64}(pomdp.σ_debris^2 * I, 6, 6)
+    R_sc = pomdp.R_sc
+    R_db = pomdp.R_debris
     μ_sc, Σ_sc = _kalman_correct_linear(b.sc.μ, b.sc.Σ, z[sc_range], R_sc)
     μ_db, Σ_db = _kalman_correct_linear(b.debris.μ, b.debris.Σ, z[debris_range], R_db)
     return Belief(ObjBelief(μ_sc, Σ_sc), ObjBelief(μ_db, Σ_db), b.t)
@@ -326,14 +327,14 @@ object. `z` is the full 12-vector observation (only the relevant block is read).
 """
 function correct_linear_sc(pomdp::SpacecraftCAPOMDP, b::Belief, z::AbstractVector;
                            sc_range = 1:6)
-    R_sc = Matrix{Float64}(pomdp.σ_sc^2 * I, 6, 6)
+    R_sc = pomdp.R_sc
     μ_sc, Σ_sc = _kalman_correct_linear(b.sc.μ, b.sc.Σ, z[sc_range], R_sc)
     return Belief(ObjBelief(μ_sc, Σ_sc), b.debris, b.t)
 end
 
 function correct_linear_debris(pomdp::SpacecraftCAPOMDP, b::Belief, z::AbstractVector;
                                debris_range = 7:12)
-    R_db = Matrix{Float64}(pomdp.σ_debris^2 * I, 6, 6)
+    R_db = pomdp.R_debris
     μ_db, Σ_db = _kalman_correct_linear(b.debris.μ, b.debris.Σ, z[debris_range], R_db)
     return Belief(b.sc, ObjBelief(μ_db, Σ_db), b.t)
 end

@@ -149,9 +149,19 @@ end
 Load the CDM at `path` into a near-TCA POMDP scenario (see the module header for
 the design). Uses the CDM's real TCA covariance as the belief, the real HBR, and
 a horizon equal to the CDM's lead time (creation → TCA) unless `t_horizon` (s) is
-given explicitly. `dt` is the planner/POMDP step (default 1 h). Any extra keyword
-overrides are forwarded to the `SpacecraftCAPOMDP` constructor (e.g. `Δv`,
-`pc_threshold`, `cadence_*`).
+given explicitly. `dt` is the planner/POMDP step (default 1 h).
+
+Measurement noise R and cadence are CLASS-TIERED (sensorTiers.jl): the primary
+(own asset) gets the GPS-grade isotropic R with a continuous cadence (= `dt`);
+the secondary gets ITS class's R + cadence — SSN-radar anisotropic for
+debris/rocket_body/unknown, GPS-grade for an active payload. `sensor_quality`
+(`:best`/`:median`/`:worst`) selects the SSN radar grade percentile (a sweepable
+measurement-quality knob). `sec_class_override` forces the secondary class
+(else `classify_secondary(name2)`).
+
+Any extra keyword overrides are forwarded to the `SpacecraftCAPOMDP` constructor
+(splatted LAST, so they win over the tier defaults — e.g. `Δv`, `pc_threshold`,
+`R_debris_mat`, `cadence_*`).
 
 The returned `pomdp` has `randAdd = false` (the CDM fixes the geometry — no
 element jitter), `forceModel = true`, the CDM's TCA epoch as `epochTCA`, and the
@@ -162,6 +172,8 @@ function load_cdm_scenario(path::AbstractString;
                            dt::Real = 60 * 60,
                            t_horizon::Union{Real,Nothing} = nothing,
                            backprop::Bool = true,
+                           sensor_quality::Symbol = :median,
+                           sec_class_override::Union{Symbol,Nothing} = nothing,
                            base_pomdp_kwargs...)
     cdm = parse_cdm(path)
     cdm.hbr === nothing && error("CDM at $path has no COMMENT HBR — the real " *
@@ -181,14 +193,34 @@ function load_cdm_scenario(path::AbstractString;
         Float64(t_horizon)
     end
 
+    # --- Class-tiered, SOURCED measurement noise R + cadence (sensorTiers.jl) ---
+    # The secondary's R and cadence come from ITS object class (not a hardcoded
+    # debris sensor). The PRIMARY is the own asset → GPS-grade with a CONTINUOUS
+    # cadence (≈ every step). `sec_class_override` lets a caller force a class;
+    # `sensor_quality` (:best/:median/:worst) sweeps the SSN radar grade.
+    sec_class = sec_class_override === nothing ?
+                classify_secondary(cdm.name2) : sec_class_override
+    # R is a FIXED linear matrix rotated once at the CDM state (documented Option-A
+    # approximation — the real per-pass anisotropy rotation is future work).
+    R_sc_mat     = sensor_R_eci(:payload, cdm.state1)                       # own-asset GPS
+    R_debris_mat = sensor_R_eci(sec_class, cdm.state2; quality = sensor_quality)
+    cadence_sc_tier     = Float64(dt)                # own-asset GPS ≈ continuous → every step
+    cadence_debris_tier = tier_cadence(sec_class)    # class ground-pass cadence
+
     # The combined HBR is the only radius any Pc call uses; put it all on the sc
     # side (0 on debris) so the SUM is exactly the CDM's HBR — no invented split.
+    # Tier R + cadence are defaults here; base_pomdp_kwargs may still override them
+    # (splatted last).
     pomdp = SpacecraftCAPOMDP(;
         epochTCA           = tca_tuple,
         randAdd            = false,
         forceModel         = true,
         P0_sc              = Matrix{Float64}(cdm.cov1_eci),
         P0_debris          = Matrix{Float64}(cdm.cov2_eci),
+        R_sc_mat           = R_sc_mat,
+        R_debris_mat       = R_debris_mat,
+        cadence_sc         = cadence_sc_tier,
+        cadence_debris     = cadence_debris_tier,
         R_hard_body_sc     = hbr,
         R_hard_body_debris = 0.0,
         dt                 = Float64(dt),
@@ -225,7 +257,7 @@ function load_cdm_scenario(path::AbstractString;
         cdm.state2[1:3], cdm.state2[4:6], cdm.cov2_eci, hbr)
 
     return CDMScenario(pomdp, b0, s_true, b_tca, horizon, hbr,
-                       classify_secondary(cdm.name2), validity,
+                       sec_class, validity,
                        !validity.any_violation, cdm.pc_cdm,
                        cdm.name1, cdm.name2, cdm.id1, cdm.id2,
                        cdm.miss_distance, cdm.relative_speed, cdm.tca)
