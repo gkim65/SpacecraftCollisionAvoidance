@@ -242,17 +242,146 @@ read back from brahe's covariance_gcrf (ECI). One brahe propagation does both.
 (This is the node's real tracked Σ — NOT a fresh P0; see the section header.)
 """
 function _grow_belief_to_tca(pomdp::SpacecraftCAPOMDP, μ::AbstractVector,
-                             Σ::AbstractMatrix, objParams::AbstractVector, t::Real)
+                             Σ::AbstractMatrix, objParams::AbstractVector, t::Real;
+                             q_rtn::AbstractVector = zeros(3), dt::Real = pomdp.dt)
     bh = get_brahe()
     epoch_tca     = bh.Epoch.from_datetime(pomdp.epochTCA..., bh.TimeSystem.UTC)
     epoch_current = epoch_tca - Float64(t)
-    prop, ep0 = eci2orb_brahe(collect(float.(μ)), epoch_to_tuple(epoch_current),
-                              objParams, pomdp.forceModel; initial_covariance = Matrix(Σ))
-    ep_tca = ep0 + Float64(t)
-    prop.propagate_to(ep_tca)
-    μ_tca = collect(prop.current_state()[1:6])
-    Σ_tca = _sym(collect(prop.covariance_gcrf(ep_tca)))
-    return μ_tca, Σ_tca
+
+    # Q = 0 ⇒ single-shot Φ Σ Φᵀ (byte-identical to the pre-Phase-8 path, fast).
+    if all(iszero, q_rtn) || Float64(t) <= 0.0
+        prop, ep0 = eci2orb_brahe(collect(float.(μ)), epoch_to_tuple(epoch_current),
+                                  objParams, pomdp.forceModel; initial_covariance = Matrix(Σ))
+        ep_tca = ep0 + Float64(t)
+        prop.propagate_to(ep_tca)
+        return collect(prop.current_state()[1:6]),
+               _sym(collect(prop.covariance_gcrf(ep_tca)))
+    end
+
+    # Q ≠ 0 ⇒ step the covariance in dt sub-steps so the SNC accumulation matches
+    # the belief tree's stepped `predict` exactly (a one-shot STM accumulation is
+    # NOT equivalent — later Φ Σ Φᵀ steps keep amplifying each step's added Q).
+    # The final partial step (t not a multiple of dt) uses the remainder.
+    μc = collect(float.(μ)); Σc = Matrix(Σ); tt = 0.0
+    while tt < Float64(t) - 1e-6
+        step = min(Float64(dt), Float64(t) - tt)
+        prop, ep0 = eci2orb_brahe(μc, epoch_to_tuple(epoch_tca - (Float64(t) - tt)),
+                                  objParams, pomdp.forceModel; initial_covariance = Σc)
+        prop.propagate_to(ep0 + step)
+        Σc = _sym(collect(prop.covariance_gcrf(ep0 + step)) .+ snc_q_eci(q_rtn, step, μc))
+        μc = collect(prop.current_state()[1:6])
+        tt += step
+    end
+    return μc, Σc
+end
+
+"""
+    _backprop_object_to_detection(pomdp, μ_tca, Σ_tca, objParams, t_horizon;
+                                  q_rtn, dt) -> (μ_det, Σ_det)
+
+Seed a DETECTION-epoch belief `(μ_det, Σ_det)` for one object such that
+forward-growing it to TCA (via `_grow_belief_to_tca`, the planner's own path)
+reproduces the given TCA belief `(μ_tca, Σ_tca)`. This is the covariance-fix
+back-propagation (audit F2/F3, step 2b): a real CDM is a single TCA snapshot,
+but the POMDP needs a detection→TCA belief history; a single conjunction's OD
+covariance is SMALLER at detection and GROWS toward TCA, so we back-propagate
+the CDM's TCA covariance to a tighter detection seed that forward-grows back.
+
+MEAN: back-propagated by reverse dynamics (one brahe propagation TCA→detection).
+Exact to the integrator-step floor (~0.05 m at 1 h, ~105 m at 33 h on the
+default tolerance — an integrator artifact, not physics: Keplerian, which is
+time-reversible, shows the same; tighten `NumericalPropagationConfig` tol to
+shrink it, at ~15× propagation cost). The ~105 m shifts recovered Pc by ~3 %.
+
+COVARIANCE: a single backward brahe propagation reverses the STM growth,
+Σ_det = Φ⁻¹ Σ_tca Φ⁻ᵀ (read back via `covariance_gcrf` at the detection epoch).
+This is the Q=0 reverse; when `q_rtn ≠ 0` the forward grow adds Q_acc, so the
+seed is `reverse(Σ_tca − Q_acc)` — computed by first estimating Q_acc from the
+forward grow of the Q=0 seed and reversing the Q-reduced endpoint ONCE. We do
+NOT iterate an affine residual correction: Φ⁻¹ over a multi-hour arc amplifies a
+small ECI residual enormously (the in-track/velocity inverse coupling), so
+back-propagating a residual matrix is numerically unstable and can push the seed
+non-PD. The single Q-reduced reverse is stable and recovers Σ_tca to a small
+relative error (test_cdm_scenario.jl); the residual is the integrator-asymmetry
+floor, the same ~3 % Pc effect as the mean's ~105 m.
+"""
+function _backprop_object_to_detection(pomdp::SpacecraftCAPOMDP,
+                                        μ_tca::AbstractVector, Σ_tca::AbstractMatrix,
+                                        objParams::AbstractVector, t_horizon::Real;
+                                        q_rtn::AbstractVector = zeros(3),
+                                        dt::Real = pomdp.dt)
+    bh = get_brahe()
+    epoch_tca = bh.Epoch.from_datetime(pomdp.epochTCA..., bh.TimeSystem.UTC)
+    th = Float64(t_horizon)
+
+    # One backward propagation from TCA carries the mean (reverse dynamics) and
+    # the Q=0 reverse of a covariance (Φ⁻¹ Σ Φ⁻ᵀ).
+    function reverse_meancov(μ, Σ)
+        prop, ep0 = eci2orb_brahe(collect(float.(μ)), epoch_to_tuple(epoch_tca),
+                                  objParams, pomdp.forceModel; initial_covariance = Matrix(Σ))
+        prop.propagate_to(ep0 - th)
+        return collect(prop.current_state()[1:6]),
+               _sym(collect(prop.covariance_gcrf(ep0 - th)))
+    end
+
+    μ_det, Σ_det0 = reverse_meancov(μ_tca, Σ_tca)
+    all(iszero, q_rtn) && return μ_det, Σ_det0
+
+    # Q ≠ 0: estimate the forward-accumulated process noise Q_acc from the Q=0
+    # seed's forward grow, subtract it from the endpoint, and reverse that ONCE.
+    # (Q_acc is the ADDED part, ~independent of the seed magnitude for a fixed
+    # trajectory, so one subtraction is a good approximation without iterating.)
+    _, Σ_fwd_q0 = _grow_belief_to_tca(pomdp, μ_det, Σ_det0, objParams, th; q_rtn = zeros(3), dt = dt)
+    _, Σ_fwd_q  = _grow_belief_to_tca(pomdp, μ_det, Σ_det0, objParams, th; q_rtn = q_rtn,   dt = dt)
+    Q_acc = _sym(Σ_fwd_q .- Σ_fwd_q0)
+    # Guard: if the accumulated process noise exceeds the endpoint covariance in
+    # some direction, Σ_tca − Q_acc goes non-PD (the physical signal that q is too
+    # large for this lead time — the process noise alone would over-fill the CDM's
+    # TCA covariance). Clip eigenvalues to a small positive floor so the seed stays
+    # a valid covariance; the clip firing is a red flag that q needs recalibrating.
+    Σ_reduced = _clip_pd(_sym(Matrix(Σ_tca) .- Q_acc))
+    _, Σ_det = reverse_meancov(μ_tca, Σ_reduced)
+    return μ_det, _clip_pd(Σ_det)
+end
+
+"""
+    _clip_pd(Σ; floor_rel=1e-12) -> Σ_pd
+
+Snap a symmetric matrix to the nearest PD matrix by clipping eigenvalues up to
+`floor_rel · λ_max` (a small positive floor). Used to keep a back-propagated /
+Q-reduced covariance seed a valid covariance when an over-large q would otherwise
+drive it indefinite (see `_backprop_object_to_detection`). No-op on an already-PD
+matrix to roundoff.
+"""
+function _clip_pd(Σ::AbstractMatrix; floor_rel::Real = 1e-12)
+    S = Symmetric(_sym(Σ))
+    vals, vecs = eigen(S)
+    λmax = maximum(vals)
+    λmax <= 0 && return Matrix(floor_rel * I, size(Σ)...)  # degenerate; tiny isotropic
+    floorλ = floor_rel * λmax
+    any(vals .< floorλ) || return Matrix(S)
+    vals_clipped = max.(vals, floorλ)
+    return _sym(vecs * Diagonal(vals_clipped) * transpose(vecs))
+end
+
+"""
+    backprop_belief_to_detection(pomdp, μ_sc_tca, Σ_sc_tca, μ_db_tca, Σ_db_tca,
+                                 t_horizon) -> Belief
+
+Build a detection-epoch `Belief` (time-remaining `t_horizon`) that forward-grows
+to the given TCA belief for BOTH objects, using each object's `pomdp.q_rtn_*`.
+The loader uses this to turn a single CDM TCA snapshot into a runnable
+detection→TCA scenario (see `_backprop_object_to_detection`).
+"""
+function backprop_belief_to_detection(pomdp::SpacecraftCAPOMDP,
+                                      μ_sc_tca::AbstractVector, Σ_sc_tca::AbstractMatrix,
+                                      μ_db_tca::AbstractVector, Σ_db_tca::AbstractMatrix,
+                                      t_horizon::Real)
+    μ_sc, Σ_sc = _backprop_object_to_detection(pomdp, μ_sc_tca, Σ_sc_tca,
+                                               pomdp.satParams, t_horizon; q_rtn = pomdp.q_rtn_sc)
+    μ_db, Σ_db = _backprop_object_to_detection(pomdp, μ_db_tca, Σ_db_tca,
+                                               pomdp.debrisParams, t_horizon; q_rtn = pomdp.q_rtn_debris)
+    return Belief(ObjBelief(μ_sc, Σ_sc), ObjBelief(μ_db, Σ_db), Float64(t_horizon))
 end
 
 """
@@ -273,8 +402,10 @@ function node_pc_at_tca(pomdp::SpacecraftCAPOMDP, node::BeliefNode)
         # already at TCA — use the belief (μ, Σ) directly (no growth)
         return elrod_pc(b.sc.μ, b.debris.μ, b.sc.Σ, b.debris.Σ, hbr)
     end
-    μ_sc_tca, Σ_sc_tca = _grow_belief_to_tca(pomdp, b.sc.μ,     b.sc.Σ,     pomdp.satParams,    t)
-    μ_db_tca, Σ_db_tca = _grow_belief_to_tca(pomdp, b.debris.μ, b.debris.Σ, pomdp.debrisParams, t)
+    μ_sc_tca, Σ_sc_tca = _grow_belief_to_tca(pomdp, b.sc.μ,     b.sc.Σ,     pomdp.satParams,    t;
+                                             q_rtn = pomdp.q_rtn_sc)
+    μ_db_tca, Σ_db_tca = _grow_belief_to_tca(pomdp, b.debris.μ, b.debris.Σ, pomdp.debrisParams, t;
+                                             q_rtn = pomdp.q_rtn_debris)
     return elrod_pc(μ_sc_tca, μ_db_tca, Σ_sc_tca, Σ_db_tca, hbr)
 end
 
@@ -493,7 +624,12 @@ function node_pc(pomdp::SpacecraftCAPOMDP, node::BeliefNode;
                  depth::Union{Int,Nothing} = nothing,
                  table::Union{SigmaTCATable,Nothing} = nothing,
                  sigma_mode::Symbol = MCTS_SIGMA_MODE)
-    if sigma_mode == :fast && table !== nothing && depth !== nothing
+    # The :fast per-depth debris Σ table is built WITHOUT process noise and its
+    # satellite grow is Q=0; once any q_rtn ≠ 0 (Phase-8 SNC growth fix) it is no
+    # longer valid — force the exact per-node path. (This is the documented
+    # "process noise breaks :fast" guard; see the FAST Σ PATH section header.)
+    q_on = !all(iszero, pomdp.q_rtn_sc) || !all(iszero, pomdp.q_rtn_debris)
+    if !q_on && sigma_mode == :fast && table !== nothing && depth !== nothing
         return node_pc_at_tca_fast(pomdp, node, depth, table)
     end
     return node_pc_at_tca(pomdp, node)

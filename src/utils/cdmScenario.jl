@@ -98,9 +98,18 @@ the test / later stratification. Fields:
 
 - `pomdp`      : `SpacecraftCAPOMDP` with the CDM's TCA epoch, the CDM covariances
                  as P0 (the belief), and the real combined HBR on `R_hard_body_sc`.
-- `b0`         : initial `Belief` — CDM ECI states with the CDM covariances, at
-                 time-remaining `t_horizon`.
-- `s_true`     : true `CAState` — the CDM ECI states, at `t_horizon`.
+- `b0`         : initial `Belief` at time-remaining `t_horizon`. With
+                 `backprop=true` (default) it is the DETECTION-epoch seed that
+                 forward-grows to the CDM's TCA belief (covariance-fix, step 2b);
+                 with `backprop=false` it anchors the CDM TCA covariance directly
+                 (the old near-TCA design — kept for input-fidelity checks).
+- `s_true`     : true `CAState` at `t_horizon`. Means are back-propagated to the
+                 detection epoch when `backprop=true` (so the truth and the
+                 belief share the same detection→TCA trajectory), else the CDM
+                 TCA states directly.
+- `b_tca`      : the CDM's TCA-anchored belief (time-remaining 0.5 s) — the real
+                 endpoint the back-prop seed is built to reproduce; used by tests
+                 to check elrod-at-TCA == CARA (the untouched anchor).
 - `t_horizon`  : root time-to-TCA (s) = the CDM's lead time (creation → TCA).
 - `hbr`        : combined hard-body radius (m), straight from the CDM.
 - `sec_class`  : `classify_secondary(name2)` — :debris / :rocket_body / :payload /
@@ -117,6 +126,7 @@ struct CDMScenario
     pomdp::SpacecraftCAPOMDP
     b0::Belief
     s_true::CAState
+    b_tca::Belief
     t_horizon::Float64
     hbr::Float64
     sec_class::Symbol
@@ -151,6 +161,7 @@ CDM covariances as `P0_sc` / `P0_debris`. The initial belief `b0` and true state
 function load_cdm_scenario(path::AbstractString;
                            dt::Real = 60 * 60,
                            t_horizon::Union{Real,Nothing} = nothing,
+                           backprop::Bool = true,
                            base_pomdp_kwargs...)
     cdm = parse_cdm(path)
     cdm.hbr === nothing && error("CDM at $path has no COMMENT HBR — the real " *
@@ -183,8 +194,29 @@ function load_cdm_scenario(path::AbstractString;
         dt                 = Float64(dt),
         base_pomdp_kwargs...)
 
-    b0     = belief_from_pomdp(pomdp, cdm.state1, cdm.state2, horizon)
-    s_true = CAState(collect(float.(cdm.state1)), collect(float.(cdm.state2)), horizon)
+    # The CDM's TCA-anchored belief (time-remaining ~0 s). This is the REAL
+    # endpoint — elrod on it reproduces CARA's Pc (the untouched anchor). The
+    # back-prop seed below is built to forward-grow back to exactly this.
+    b_tca = belief_from_pomdp(pomdp, cdm.state1, cdm.state2, 0.5)
+
+    if backprop
+        # Detection-epoch seed: back-propagate the CDM TCA belief (mean + cov) so
+        # that forward-growing it to TCA reproduces the CDM endpoint (covariance
+        # fix, audit F2/F3 step 2b). Means AND covariances are back-propagated so
+        # the truth and belief share the same detection→TCA trajectory; growing
+        # the loader root FORWARD to TCA then lands on the conjunction geometry
+        # (the old direct-anchor root grew the TCA geometry 33 h PAST TCA → Pc→0).
+        b0 = backprop_belief_to_detection(pomdp,
+                 collect(float.(cdm.state1)), Matrix{Float64}(cdm.cov1_eci),
+                 collect(float.(cdm.state2)), Matrix{Float64}(cdm.cov2_eci), horizon)
+        s_true = CAState(copy(b0.sc.μ), copy(b0.debris.μ), horizon)
+    else
+        # Old near-TCA design: anchor the CDM TCA covariance directly as the belief
+        # at time-remaining `horizon` (no back-propagation). Kept for the loader's
+        # input-fidelity checks; NOT physically the detection→TCA scenario.
+        b0     = belief_from_pomdp(pomdp, cdm.state1, cdm.state2, horizon)
+        s_true = CAState(collect(float.(cdm.state1)), collect(float.(cdm.state2)), horizon)
+    end
 
     # Validity flag (flag only — no handling this session). Runs the 53/53-exact
     # usage-violation detector on the CDM's OWN states + covariances at TCA.
@@ -192,7 +224,7 @@ function load_cdm_scenario(path::AbstractString;
         cdm.state1[1:3], cdm.state1[4:6], cdm.cov1_eci,
         cdm.state2[1:3], cdm.state2[4:6], cdm.cov2_eci, hbr)
 
-    return CDMScenario(pomdp, b0, s_true, horizon, hbr,
+    return CDMScenario(pomdp, b0, s_true, b_tca, horizon, hbr,
                        classify_secondary(cdm.name2), validity,
                        !validity.any_violation, cdm.pc_cdm,
                        cdm.name1, cdm.name2, cdm.id1, cdm.id2,

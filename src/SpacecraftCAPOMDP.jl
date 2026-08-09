@@ -15,6 +15,28 @@ CAState(sc_eci, debris_eci, t)     = CAState(sc_eci, debris_eci, t, false)
 
 @enum CAAction WAIT=1 MANEUVER=2
 
+# --- SNC process-noise PSD presets (m²/s³ per RTN axis, [q_R, q_T, q_N]) ------
+# The predict/grow step adds Q_rtn = diag(q)⊗[[dt³/3,dt²/2],[dt²/2,dt]] (rotated
+# RTN→ECI) to Φ Σ Φᵀ. `q` is a constant PSD; the ADDED matrix scales with dt (NOT
+# a flat Q₀). Anisotropic: along-track (T) carries the growth, R/N a small floor
+# so those axes stay ~flat (matching the measured real RTN shape). Calibrated
+# against the real CARA growth curves — see CONSTANTS.md "Filter process noise Q".
+#
+# Q_RTN_WELL_TRACKED — the well-tracked / primary-like level. INTENDED to make
+# along-track σ ∝ τ^~1.9 over 0.5–5.5 d, matching the real primary curve
+# (notes/cara_covariance_growth_realism_findings.md; payload secondaries grow
+# similarly, p≈1.65). **NOT YET CALIBRATED — held at zeros(3) (Q = 0), so the
+# default belief growth is byte-identical to the pre-Phase-8 STM.** The 2026-08-08
+# session wired the full SNC-Q machinery + back-prop and confirmed the calibration
+# is a standalone fit (our STM is the no-drag growth; a radial seed maps to large
+# in-track by Keplerian δa→along-track drift, and the once-per-orbit STM ripple
+# competes with the SNC accumulation so a naive q_T sweep tops out ~p1.4–1.5, not
+# the smooth real τ^1.9). Calibrating it — orbital-phase averaging / DMC vs SNC /
+# seed treatment + a χ² containment check — is the next task (see the session
+# note + growth-notes TODO #1/#2). Set a per-conjunction q via q_rtn_sc/q_rtn_debris
+# once calibrated. See CONSTANTS.md "Filter process noise Q (SNC)".
+const Q_RTN_WELL_TRACKED = [0.0, 0.0, 0.0]  # [q_R, q_T, q_N] — Q=0 until calibrated
+
 
 struct SpacecraftCAPOMDP <: POMDP{CAState, CAAction, Vector{Float64}}  # POMDP{State, Action, Observation}
     satParams::Vector{Float64}         # Spacecraft parameters: [mass, drag_area, Cd, srp_area, Cr]
@@ -41,6 +63,15 @@ struct SpacecraftCAPOMDP <: POMDP{CAState, CAAction, Vector{Float64}}  # POMDP{S
     σ_debris::Float64  # debris measurement noise std (m, m/s)
     R_hard_body_sc::Float64      # spacecraft hard body radius (m), default 5.0
     R_hard_body_debris::Float64  # debris hard body radius (m), default 15.0
+    # SNC (state-noise-compensation) process-noise PSD per RTN axis (m²/s³), one
+    # 3-vector [q_R, q_T, q_N] per object. The predict/grow step adds
+    #   Q_rtn = diag(q_i)⊗[[dt³/3, dt²/2],[dt²/2, dt]]  (rotated RTN→ECI),
+    # bending the Q=0 STM growth (σ∝τ^~1.4) up toward the drag-driven ~τ² real
+    # growth. Anisotropic (along-track T dominant) to match the measured RTN
+    # shape. Per-conjunction changeable (forwarded via load_cdm_scenario kwargs).
+    # See CONSTANTS.md "Filter process noise Q (SNC)". q_rtn = zeros(3) ⇒ Q=0.
+    q_rtn_sc::Vector{Float64}
+    q_rtn_debris::Vector{Float64}
     pc_threshold::Float64 # TODO: not working right now
     dt::Float64  # timestep in seconds, default 30 minutes
     cadence_sc::Float64      # satellite measurement cadence (s) — onboard GPS, ~2 h
@@ -79,6 +110,14 @@ function SpacecraftCAPOMDP(;
     σ_debris = 1000.0, # SSN/TLE ~1 km at OD epoch (Flohrer 2008 / ESA SDC5)
     R_hard_body_sc = 5.0,  # meters, typical spacecraft radius TODO
     R_hard_body_debris = 15.0,  # meters, typical debris radius TODO
+    # SNC process-noise PSD per RTN axis (m²/s³). Default = the well-tracked
+    # (primary-like) level, calibrated so Φ Σ Φᵀ + Q grows along-track σ ∝ τ^~1.9
+    # to match the real CARA primary curve (notes/cara_covariance_growth_realism
+    # _findings.md). Along-track (T) dominant; small R/N floor keeps those axes
+    # ~flat as in the real data. Debris (steeper, altitude-split) presets are in
+    # CONSTANTS.md — pass q_rtn_debris=... per case. See Q_RTN_* consts below.
+    q_rtn_sc = Q_RTN_WELL_TRACKED,
+    q_rtn_debris = Q_RTN_WELL_TRACKED,
     pc_threshold = 1e-5, # Similar to spacex TODO
     dt = 30*60,  # 30 minute steps
     cadence_sc = 2*60*60,      # 2 h — GPS operator-contact cadence (swappable; ablation)
@@ -100,8 +139,10 @@ function SpacecraftCAPOMDP(;
 	return SpacecraftCAPOMDP(satParams,debrisParams,epochTCA,forceModel,
                             R_alt,e,i,Ω,ω,M,seed,randAdd,
                             conjunctionType,rMag,vMag,
-                            TCA_max, Δv,maneuver_cost, 
-                            P0_sc, P0_debris,σ_sc, σ_debris,R_hard_body_sc, R_hard_body_debris, pc_threshold, dt,
+                            TCA_max, Δv,maneuver_cost,
+                            P0_sc, P0_debris,σ_sc, σ_debris,R_hard_body_sc, R_hard_body_debris,
+                            collect(float.(q_rtn_sc)), collect(float.(q_rtn_debris)),
+                            pc_threshold, dt,
                             cadence_sc, cadence_debris, correct_at_root, γ)
 end
 

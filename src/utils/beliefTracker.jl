@@ -115,6 +115,67 @@ end
 _sym(Σ::AbstractMatrix) = (Matrix(Σ) .+ transpose(Matrix(Σ))) ./ 2
 
 # =========================================================================
+# SNC PROCESS NOISE (Phase 8 growth fix, 2026-08-08).
+#
+# Our predict step was Σ⁻ = Φ Σ Φᵀ (Q = 0), a documented under-grower: real
+# along-track OD covariance grows ~τ² (drag-driven), a noiseless linear STM only
+# reaches ~τ^1.4 (notes/cara_covariance_growth_realism_findings.md §6). The fix
+# is a tuned State-Noise-Compensation term (NASA CARA's own remedy; Zaidi &
+# Hejduk 2016): Σ⁻ = Φ Σ Φᵀ + Q, with the standard SNC discrete matrix
+#
+#   Q_axis(dt) = q · [[dt³/3, dt²/2],
+#                     [dt²/2, dt   ]]   on each (position, velocity) axis pair,
+#
+# where q (m²/s³) is a constant PSD and the ADDED matrix scales with dt (NOT a
+# flat Q₀ — a flat Q₀ is step-size-inconsistent). The velocity variance
+# accumulates q·dt each step; that accumulation is what bends the growth up
+# toward τ² (verified in the growth study's 1-D prototype). q is ANISOTROPIC in
+# RTN (along-track T dominant, small radial/cross floor) to match the measured
+# RTN shape, keyed per-object per-conjunction via pomdp.q_rtn_{sc,debris}.
+# =========================================================================
+
+"""
+    _rtn_rotation(state) -> 3×3
+
+RTN→ECI rotation whose COLUMNS are the RTN basis in ECI (R radial, T in-track,
+N cross-track), so `v_eci = R * v_rtn`. Self-contained copy of the cdmParser
+helper so beliefTracker (included before cdmParser) does not depend on it.
+"""
+function _rtn_rotation(state::AbstractVector)
+    r = state[1:3]; v = state[4:6]
+    r_hat = r ./ norm(r)
+    n_hat = cross(r, v) ./ norm(cross(r, v))
+    t_hat = cross(n_hat, r_hat)
+    return hcat(r_hat, t_hat, n_hat)   # columns R, T, N
+end
+
+"""
+    snc_q_eci(q_rtn, dt, state) -> 6×6
+
+Discrete SNC process-noise covariance for one object over a step `dt` (s),
+built per RTN axis from the PSD 3-vector `q_rtn = [q_R, q_T, q_N]` (m²/s³) and
+rotated into ECI at `state`. Each axis contributes the standard block
+`q·[[dt³/3, dt²/2],[dt²/2, dt]]` coupling that axis's position and velocity.
+`q_rtn == zeros(3)` ⇒ the zero matrix (Q = 0, the pre-Phase-8 behavior).
+"""
+function snc_q_eci(q_rtn::AbstractVector, dt::Real, state::AbstractVector)
+    dt = Float64(dt)
+    Q_rtn = zeros(6, 6)
+    for i in 1:3
+        q = Float64(q_rtn[i])
+        q == 0.0 && continue
+        Q_rtn[i, i]         = q * dt^3 / 3
+        Q_rtn[i, 3 + i]     = q * dt^2 / 2
+        Q_rtn[3 + i, i]     = q * dt^2 / 2
+        Q_rtn[3 + i, 3 + i] = q * dt
+    end
+    all(Q_rtn .== 0.0) && return Q_rtn
+    R = _rtn_rotation(state)
+    A = zeros(6, 6); A[1:3, 1:3] = R; A[4:6, 4:6] = R
+    return _sym(A * Q_rtn * transpose(A))
+end
+
+# =========================================================================
 # PREDICT — propagate (μ, Σ) forward one dt step given an action.
 #
 # μ:  reuse the transitions.jl path — apply the maneuver Δv to the spacecraft
@@ -138,7 +199,8 @@ function _predict_object(pomdp::SpacecraftCAPOMDP,
                          μ::AbstractVector, Σ::AbstractMatrix,
                          objParams::AbstractVector,
                          epoch_current, dt::Real;
-                         Δv_applied::Union{AbstractVector,Nothing} = nothing)
+                         Δv_applied::Union{AbstractVector,Nothing} = nothing,
+                         q_rtn::AbstractVector = zeros(3))
     μ0 = collect(float.(μ))
     if Δv_applied !== nothing
         μ0 = μ0 .+ collect(float.(Δv_applied))
@@ -149,7 +211,10 @@ function _predict_object(pomdp::SpacecraftCAPOMDP,
     ep_next = ep0 + Float64(dt)
     prop.propagate_to(ep_next)
     μ_next = collect(prop.current_state()[1:6])
-    Σ_next = _sym(collect(prop.covariance_gcrf(ep_next)))
+    # Σ⁻ = Φ Σ Φᵀ + Q_snc(dt): the SNC term is built from the PRE-step state RTN
+    # (the axes the process noise acts along over the step) and added to brahe's
+    # propagated covariance. q_rtn == 0 ⇒ Q = 0 (byte-identical to the old path).
+    Σ_next = _sym(collect(prop.covariance_gcrf(ep_next)) .+ snc_q_eci(q_rtn, dt, μ0))
     return μ_next, Σ_next
 end
 
@@ -180,9 +245,10 @@ function predict(pomdp::SpacecraftCAPOMDP, b::Belief, a::CAAction; dt::Real = po
     end
 
     μ_sc, Σ_sc = _predict_object(pomdp, b.sc.μ, b.sc.Σ, pomdp.satParams,
-                                 epoch_current, dt; Δv_applied = Δv_sc)
+                                 epoch_current, dt; Δv_applied = Δv_sc,
+                                 q_rtn = pomdp.q_rtn_sc)
     μ_db, Σ_db = _predict_object(pomdp, b.debris.μ, b.debris.Σ, pomdp.debrisParams,
-                                 epoch_current, dt)
+                                 epoch_current, dt; q_rtn = pomdp.q_rtn_debris)
 
     return Belief(ObjBelief(μ_sc, Σ_sc), ObjBelief(μ_db, Σ_db), b.t - Float64(dt))
 end

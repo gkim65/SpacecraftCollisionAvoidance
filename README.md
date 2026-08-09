@@ -54,7 +54,7 @@ src/
     covarianceTable.jl             precomputed Σ(τ) table + Pc-through-Σ(τ) check
     beliefTracker.jl               Kalman predict/correct belief tracker (Phase 4)
     beliefMCTS.jl                  belief-space MCTS: Pc-at-TCA reward (elrod_pc) + chance constraint (Phase 5/6)
-    cdmScenario.jl                 NASA CARA CDM → POMDP scenario loader (real conjunction, near-TCA belief)
+    cdmScenario.jl                 NASA CARA CDM → POMDP scenario loader (real conjunction; back-propagated detection→TCA belief)
   tests/
     test_chan_crossvalidation.jl   Julia-vs-Python Chan cross-validation
     test_conjunction_generator.jl  conjunction geometry + Pc-vs-miss sanity check
@@ -493,22 +493,33 @@ trace   = run_episode(planner, pomdp, s0, MersenneTwister(7))
 
 `src/utils/cdmScenario.jl` turns a real NASA CARA CDM (Conjunction Data Message)
 into a POMDP scenario the planner can run on, instead of a synthetic fixture.
-`load_cdm_scenario(path)` parses the CDM (via `src/tests/cdmParser.jl`), uses its
-**real TCA covariance directly as the belief** (`P0_sc` = the primary's ECI
-covariance, `P0_debris` = the secondary's), preserves the **real hard-body radius**
-from the CDM's `COMMENT HBR` (put entirely on `R_hard_body_sc`, since every Pc call
-uses only the sum — CDMs carry a single combined HBR), tags the secondary's class
-(`classify_secondary`), and flags whether the case is a 2D-Pc **usage violation**
-(`usageViolationCurvilinear.jl`, the 53/53-exact detector). The planning **horizon**
-is the CDM's own lead time (`CREATION_DATE` → `TCA`).
+`load_cdm_scenario(path)` parses the CDM (via `src/tests/cdmParser.jl`), preserves
+the **real hard-body radius** from the CDM's `COMMENT HBR` (put entirely on
+`R_hard_body_sc`, since every Pc call uses only the sum — CDMs carry a single
+combined HBR), tags the secondary's class (`classify_secondary`), and flags whether
+the case is a 2D-Pc **usage violation** (`usageViolationCurvilinear.jl`, the
+53/53-exact detector). The planning **horizon** is the CDM's own lead time
+(`CREATION_DATE` → `TCA`).
 
-This is a **near-TCA** scenario: the CDM covariance *is* the belief at the root
-(operationally defensible — operators decide using the latest CDM's covariance).
-The detection→TCA back-propagation that would seed an evolving belief is a later
-"covariance fix" — until then, `node_pc_at_tca` grows the near-TCA belief *forward*
-to TCA, which is only physically the conjunction at τ→0. Evaluated **at TCA**,
-`elrod_pc` on the loaded CDM reproduces NASA's operational Pc to ~0.02% (SWIFT vs
-JILIN-01 GAOFEN 2A: elrod 2.324e-3 vs CARA 2.324e-3).
+**Detection→TCA back-propagation (default, `backprop=true`).** A CDM is a single
+snapshot at TCA, but the POMDP needs a detection→TCA belief history to plan over. A
+single conjunction's own OD covariance is *smaller* at detection and *grows* toward
+TCA, so the loader back-propagates the CDM's TCA belief (mean via reverse dynamics,
+covariance via the reversed STM growth) to a tighter **detection-epoch seed** `b0`
+that forward-grows back to the real CDM endpoint. Growing that seed *forward* to TCA
+then lands on the conjunction geometry and reproduces NASA's operational Pc — on
+SWIFT vs JILIN-01 GAOFEN 2A, `node_pc` from the seed recovers **2.25e-3 vs CARA
+2.324e-3** (~3%; the residual is the ~105 m integrator-step floor of the mean
+round-trip, not physics — see `CONSTANTS.md`). The untouched real endpoint is kept
+as `sc.b_tca`, on which `elrod_pc` at TCA matches CARA to ~0.02%. Pass
+`backprop=false` for the old **near-TCA** design (the CDM covariance *is* the belief
+at the root, no back-propagation) — kept for input-fidelity checks.
+
+**Process-noise Q (SNC).** `predict`/`_grow_belief_to_tca` support an anisotropic
+SNC process-noise term (`q_rtn_sc` / `q_rtn_debris`, per-conjunction changeable) that
+bends the belief-covariance growth toward the drag-driven ~τ² real law. It defaults
+to **q = 0** (byte-identical to the pre-Phase-8 STM); the growth-realistic `q` is not
+yet calibrated (`CONSTANTS.md` "Filter process noise Q (SNC)").
 
 ```julia
 include("src/SpacecraftCollisionAvoidance.jl")   # + Brahe deps, as elsewhere
@@ -526,5 +537,7 @@ julia --project=. src/tests/test_cdm_scenario.jl
 Loads the clean payload-vs-payload case and asserts the scenario is well-formed
 (finite states, positive-definite belief covariances, HBR preserved from the CDM,
 secondary class tagged `:payload`, validity flag set, horizon = the CDM's lead
-time) and that `elrod_pc` at TCA matches CARA's operational Pc. The end-to-end
-`plan` assertion is skipped pending the covariance fix (see the test's TODO).
+time), that `elrod_pc` on the untouched TCA endpoint (`b_tca`) matches CARA's
+operational Pc, and that the **back-propagated detection seed forward-grows back to
+CARA's Pc** (the covariance-fix round-trip — recovers Pc to <0.3 dex and the CDM TCA
+covariance to <5%).

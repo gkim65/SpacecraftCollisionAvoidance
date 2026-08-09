@@ -9,14 +9,16 @@
 #      radii equals COMMENT HBR exactly), the secondary class tagged, and the
 #      usage-violation validity flag set. The horizon equals the CDM's lead time
 #      (creation → TCA).
-#   2. BELIEF == CDM COVARIANCE — the loaded belief's Σ is exactly the CDM's TCA
-#      covariance (the near-TCA design: the CDM covariance IS the belief, no
-#      back-propagation / Σ(τ) growth this session).
-#   3. Pc SANITY — node_pc_at_tca on the root belief is finite, in [0,1], and in
-#      the same ballpark as CARA's own operational Pc for this conjunction (both
-#      evaluate a 2D Pc from the same TCA states + covariances + HBR).
-#   4. PLANNER RUNS — a `plan` call succeeds and returns a valid action, with both
-#      actions visited (a sane, non-degenerate tree).
+#   2. BELIEF ANCHORING — with the covariance fix (backprop=true default) the
+#      loaded belief b0 is the DETECTION-epoch seed (≠ CDM covariance); `b_tca`
+#      holds the untouched CDM TCA endpoint. backprop=false restores the old
+#      near-TCA design (belief == CDM covariance) for input-fidelity checks.
+#   3. Pc ANCHOR — elrod on `b_tca` (the real TCA states + covariances + HBR)
+#      reproduces CARA's operational Pc; this anchor must stay exact.
+#   4. BACK-PROP ROUND-TRIP — the detection seed b0, forward-grown to TCA by the
+#      planner's node_pc path, recovers CARA's Pc (meaningful, non-zero) and the
+#      seed covariance forward-grows back to the CDM TCA covariance. (This is the
+#      step-2b covariance fix; it replaces the old @test_skip planner-run block.)
 #
 # This is the "behaving sensibly" bar for the loader — NOT a sweep, NOT all 53,
 # NOT baselines.
@@ -92,52 +94,56 @@ _pd(A) = (try; cholesky(Symmetric(Matrix(A))); true; catch; false; end)
         @test sc.s_true.t == sc.t_horizon
     end
 
-    @testset "2. belief Σ IS the CDM TCA covariance" begin
-        # near-TCA design: the CDM covariance is used directly as the belief P0,
-        # so the loaded belief Σ must equal the POMDP P0 (no growth applied here).
-        @test sc.b0.sc.Σ == sc.pomdp.P0_sc
-        @test sc.b0.debris.Σ == sc.pomdp.P0_debris
-        # and the belief means are the CDM ECI states
+    @testset "2. belief anchoring (backprop default vs near-TCA)" begin
+        # DEFAULT (backprop=true, covariance-fix step 2b): the loaded belief is the
+        # DETECTION-epoch seed that forward-grows to the CDM TCA belief, NOT the CDM
+        # covariance directly. `b_tca` holds the untouched real endpoint (the CDM
+        # TCA covariance) — elrod on it reproduces CARA (block 3).
+        @test sc.b_tca.sc.Σ == sc.pomdp.P0_sc            # b_tca IS the CDM TCA cov
+        @test sc.b_tca.debris.Σ == sc.pomdp.P0_debris
+        @test sc.b_tca.t == 0.5                          # anchored at TCA
+        # the detection seed differs from the TCA covariance (it back-propagated)
+        @test sc.b0.t == sc.t_horizon
+        @test sc.b0.sc.Σ != sc.pomdp.P0_sc               # seed ≠ endpoint
+        @test all(isfinite, sc.b0.sc.Σ) && _pd(sc.b0.sc.Σ)
+        @test all(isfinite, sc.b0.debris.Σ) && _pd(sc.b0.debris.Σ)
+        # truth means back-propagated to detection (== the seed belief means)
         @test sc.b0.sc.μ == sc.s_true.sc_eci
         @test sc.b0.debris.μ == sc.s_true.debris_eci
+
+        # OLD near-TCA design still available via backprop=false: belief == CDM cov.
+        sc_nb = load_cdm_scenario(JILIN_CDM; backprop = false)
+        @test sc_nb.b0.sc.Σ == sc_nb.pomdp.P0_sc
+        @test sc_nb.b0.debris.Σ == sc_nb.pomdp.P0_debris
+        @test sc_nb.b0.sc.μ == sc_nb.s_true.sc_eci
     end
 
-    @testset "3. Pc sanity vs CARA operational Pc (at TCA)" begin
-        # The loaded scenario's INPUTS (states + TCA covariances + HBR) are the
-        # right ones: `elrod_pc` on them AT TCA must reproduce CARA's operational
-        # Pc for this conjunction. (This is the input-fidelity check for the
-        # loader. The planner's forward Pc from a near-TCA-anchored belief grown
-        # the rest of the way to TCA is a SEPARATE, deferred concern — the
-        # detection→TCA back-propagation / covariance fix is a later session, per
-        # the design note; anchoring the CDM's TCA covariance t_horizon hours
-        # BEFORE TCA and re-growing it is not physically the conjunction until
-        # that fix lands, so we do NOT assert on the grown value here.)
-        pc_direct = node_pc(sc.pomdp,
-            BeliefNode(belief_from_pomdp(sc.pomdp, sc.s_true.sc_eci, sc.s_true.debris_eci, 0.5),
-                       CAState(sc.s_true.sc_eci, sc.s_true.debris_eci, 0.5), false),
-            sigma_mode = :exact)
-        @test isfinite(pc_direct)
-        @test 0.0 <= pc_direct <= 1.0
+    @testset "3. Pc anchor: elrod at TCA == CARA (untouched real endpoint)" begin
+        # The scenario's real endpoint (`b_tca`, the CDM TCA states + covariances +
+        # HBR) must reproduce CARA's operational Pc — this is the input-fidelity
+        # anchor the back-prop is built to recover, and must stay exact regardless
+        # of the covariance fix.
+        pc_tca = node_pc(sc.pomdp, BeliefNode(sc.b_tca, sc.s_true, false); sigma_mode = :exact)
+        @test isfinite(pc_tca) && 0.0 <= pc_tca <= 1.0
         @test sc.pc_cdm > 0
-        # elrod_pc matches CARA to ~0.02% on this case; allow 1 dex slack.
-        @test abs(log10(pc_direct) - log10(sc.pc_cdm)) < 1.0
+        @test abs(log10(pc_tca) - log10(sc.pc_cdm)) < 1.0   # elrod ~0.02% on this case
     end
 
-    @testset "4. planner runs on the real conjunction (SKIPPED — revisit)" begin
-        # A shallow (max_depth = 1) `plan` call HAS been confirmed to run on this
-        # loaded scenario (returns a valid action, visits both actions) — see the
-        # session note. It is skipped in the automated suite for two reasons:
-        #   (a) COST — even depth-1 exact planning is ~20 s of brahe propagation,
-        #       and a full-horizon (~33-step) exact plan is minutes; too slow for
-        #       a unit test.
-        #   (b) SEMANTICS — the planner grows the near-TCA-anchored belief FORWARD
-        #       to TCA, which is not the conjunction geometry until the deferred
-        #       detection→TCA back-propagation / covariance fix lands (next
-        #       session). Until then the forward Pc is ~0 and asserting on the
-        #       chosen action would bake in a soon-to-change behavior.
-        # TODO(covariance-fix session): once the belief is seeded correctly back
-        # from TCA, re-enable a real `plan` assertion here (sane action + Pc
-        # driven toward CARA's operational value over the horizon).
-        @test_skip false
+    @testset "4. back-prop round-trip: seed forward-grows to CDM Pc" begin
+        # THE covariance-fix deliverable (step 2b): the DETECTION-epoch seed b0,
+        # forward-grown to TCA by the planner's own node_pc path, must recover
+        # CARA's operational Pc — i.e. growing the seed forward lands on the real
+        # conjunction geometry (the old direct-anchor root grew it 33 h PAST TCA →
+        # Pc→0, block-4 was @test_skip). At the Q=0 default the recovery is ~3%
+        # (0.014 dex); the ~105 m mean integrator floor sets the residual.
+        pc_fwd = node_pc(sc.pomdp, BeliefNode(sc.b0, sc.s_true, false); sigma_mode = :exact)
+        @test isfinite(pc_fwd) && 0.0 <= pc_fwd <= 1.0
+        @test pc_fwd > 0                                       # meaningful, NOT ~0
+        @test abs(log10(pc_fwd) - log10(sc.pc_cdm)) < 0.3      # recovers CARA (< 2×)
+
+        # and the seed covariance forward-grows back to the CDM TCA covariance
+        μsc, Σsc = _grow_belief_to_tca(sc.pomdp, sc.b0.sc.μ, sc.b0.sc.Σ,
+                                       sc.pomdp.satParams, sc.b0.t; q_rtn = sc.pomdp.q_rtn_sc)
+        @test norm(Σsc - sc.pomdp.P0_sc) / norm(sc.pomdp.P0_sc) < 0.05   # <5% cov recover
     end
 end
