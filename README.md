@@ -489,6 +489,36 @@ planner = MCTSPlanner(pomdp; n_iterations = 60, max_depth = 6, dt = pomdp.dt)
 trace   = run_episode(planner, pomdp, s0, MersenneTwister(7))
 ```
 
+Pass `verbose = true` to `run_episode` to stream a per-step `@info` line as each
+step executes (intermediate progress for long / cluster runs).
+
+#### Config-in / metrics-out: `run_episode_metrics` (for sweeps)
+
+For a parameter sweep (e.g. on a cluster with wandb) a caller wants **one config in,
+one flat metrics dict out**. `run_episode_metrics(cfg)` (`beliefExecutor.jl`) is that
+wrapper: given a config dict (build one with `episode_config`), it loads the CDM
+scenario, builds a per-step **adaptive decision grid** (receding horizon), runs
+`run_episode`, and returns a single JSON-serializable `Dict{String,Any}` — all
+scalars / strings / flat vectors / list-of-flat-dicts, so `wandb.log(dict)` is
+trivial (the wandb client itself is intentionally NOT a dependency here). The dict
+carries the echoed config, scenario provenance, the core metrics
+(resolved-without-maneuver, peak / integrated / at-TCA Pc, total Δv, maneuver count +
+timings, final miss), a **decision-vs-feasibility** verdict (did it defer where WAIT
+was feasible / maneuver where not, judged against the no-maneuver `wait_spine_pc`
+curve), a well-formedness self-check, the full per-step trace, and the WAIT-spine
+feasibility curve.
+
+```julia
+cfg = episode_config(; case_path = "data/cara_cdms/<a CDM>.cdm",
+                     coarse = 8*3600, sensor_quality = :best, sigma_mode = :exact,
+                     n_iterations = 12, seed = 20240809)
+m = run_episode_metrics(cfg)          # -> Dict; a cluster script does wandb.log(m)
+m["resolved_without_maneuver"], m["total_dv_mps"], m["decision_matches_feasibility"]
+```
+
+`figureScripts/full_rollout_run.jl` runs this end-to-end on two real debris cases and
+dumps each dict to `figureScripts/data/full_rollout_*.json`.
+
 ### Running the planner on a real NASA conjunction (CDM scenario loader)
 
 `src/utils/cdmScenario.jl` turns a real NASA CARA CDM (Conjunction Data Message)
