@@ -236,7 +236,7 @@ end
     end
 
     # -----------------------------------------------------------------
-    @testset "6. Pc-at-TCA from a node matches direct chan_pc (Option 2)" begin
+    @testset "6. Pc-at-TCA from a node matches direct elrod_pc (Option 2)" begin
         pomdp = SpacecraftCAPOMDP(seed = 42, randAdd = false, dt = 60 * 60,
                                   TCA_max = 3 * 60 * 60)
         # feasible co-orbital cross-track fixture (v_rel = 15 m/s), 2 h before TCA
@@ -249,14 +249,16 @@ end
         @test 0.0 <= pc <= 1.0
         @test pc > 0.0                       # a real 500 m cross-track conjunction
 
-        # Direct chan_pc: propagate the node's belief MEAN and its ACCUMULATED Σ
+        # Direct elrod_pc: propagate the node's belief MEAN and its ACCUMULATED Σ
         # to TCA (the node's own tracked covariance, NOT a fresh P0), then call
-        # chan_pc. node_pc_at_tca is exactly this, refactored ⇒ match to roundoff.
+        # elrod_pc — the Pc method node_pc_at_tca now uses (swapped from chan_pc
+        # for anisotropy robustness). node_pc_at_tca is exactly this, refactored
+        # ⇒ match to roundoff.
         b = node.belief
         hbr = pomdp.R_hard_body_sc + pomdp.R_hard_body_debris
         μ_sc, Σ_sc = _grow_belief_to_tca(pomdp, b.sc.μ,     b.sc.Σ,     pomdp.satParams,    b.t)
         μ_db, Σ_db = _grow_belief_to_tca(pomdp, b.debris.μ, b.debris.Σ, pomdp.debrisParams, b.t)
-        pc_direct = chan_pc(μ_sc, μ_db, Σ_sc, Σ_db, hbr)
+        pc_direct = elrod_pc(μ_sc, μ_db, Σ_sc, Σ_db, hbr)
         @test pc ≈ pc_direct rtol = 1e-12
 
         # The distinguishing test (the root-node checks above pass under EITHER
@@ -273,7 +275,7 @@ end
                                      Matrix{Float64}(pomdp.P0_sc), pomdp.satParams, child.belief.t)
         m2, S2 = _grow_belief_to_tca(pomdp, child.belief.debris.μ,
                                      Matrix{Float64}(pomdp.P0_debris), pomdp.debrisParams, child.belief.t)
-        pc_child_p0 = chan_pc(m1, m2, S1, S2, hbr)
+        pc_child_p0 = elrod_pc(m1, m2, S1, S2, hbr)
         @test !isapprox(pc_child_acc, pc_child_p0; rtol = 1e-3)       # models genuinely differ
         @test pc_child_acc == child.pc                                # cached the accumulated-Σ Pc
     end

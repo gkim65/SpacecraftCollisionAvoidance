@@ -20,6 +20,7 @@ include("transitions.jl")
 include("utils/beliefTracker.jl")
 include("utils/beliefMCTS.jl")
 include("utils/beliefExecutor.jl")
+include("utils/cdmScenario.jl")
 
 # export
 # end

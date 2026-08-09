@@ -260,7 +260,7 @@ end
 
 Pc-at-TCA for `node` (architecture §4 step 5 / §7), using the node's ACCUMULATED
 belief Σ (see the section header): propagate both sub-beliefs' `(μ, Σ)` to TCA
-(mean carried forward, the tracked Σ grown as Φ Σ Φᵀ) and evaluate `chan_pc` on
+(mean carried forward, the tracked Σ grown as Φ Σ Φᵀ) and evaluate `elrod_pc` on
 the two ECI states + two ECI covariances + combined hard-body radius. If the node
 is already at/after TCA (τ ≤ PC_TAU_MATCH_ATOL) the belief `(μ, Σ)` is used
 directly (no propagation). Returns Pc in [0, 1].
@@ -271,11 +271,11 @@ function node_pc_at_tca(pomdp::SpacecraftCAPOMDP, node::BeliefNode)
     hbr = pomdp.R_hard_body_sc + pomdp.R_hard_body_debris
     if t <= PC_TAU_MATCH_ATOL
         # already at TCA — use the belief (μ, Σ) directly (no growth)
-        return chan_pc(b.sc.μ, b.debris.μ, b.sc.Σ, b.debris.Σ, hbr)
+        return elrod_pc(b.sc.μ, b.debris.μ, b.sc.Σ, b.debris.Σ, hbr)
     end
     μ_sc_tca, Σ_sc_tca = _grow_belief_to_tca(pomdp, b.sc.μ,     b.sc.Σ,     pomdp.satParams,    t)
     μ_db_tca, Σ_db_tca = _grow_belief_to_tca(pomdp, b.debris.μ, b.debris.Σ, pomdp.debrisParams, t)
-    return chan_pc(μ_sc_tca, μ_db_tca, Σ_sc_tca, Σ_db_tca, hbr)
+    return elrod_pc(μ_sc_tca, μ_db_tca, Σ_sc_tca, Σ_db_tca, hbr)
 end
 
 # =========================================================================
@@ -456,7 +456,7 @@ end
 Fast Pc-at-TCA (efficiency pass): propagate the SATELLITE belief exactly (mean+Σ
 to TCA — the sat Σ is not tabled), propagate only the DEBRIS mean (mean-only, the
 ~11×-cheaper propagation) and read the debris Σ-at-TCA for this `depth` from the
-precomputed `table`, then call `chan_pc`. Numerically EXACT vs. `node_pc_at_tca`
+precomputed `table`, then call `elrod_pc`. Numerically EXACT vs. `node_pc_at_tca`
 (`:exact`): the debris Σ is bitwise branch-invariant (table lookup == per-node
 propagation) and the satellite is propagated per node, so no approximation is
 introduced. `depth` is the node's tree depth (root = 0); deeper than the table was
@@ -472,11 +472,11 @@ function node_pc_at_tca_fast(pomdp::SpacecraftCAPOMDP, node::BeliefNode,
         return node_pc_at_tca(pomdp, node)          # out of table range → exact
     end
     if t <= PC_TAU_MATCH_ATOL
-        return chan_pc(b.sc.μ, b.debris.μ, b.sc.Σ, table.Σ_db[idx], hbr)
+        return elrod_pc(b.sc.μ, b.debris.μ, b.sc.Σ, table.Σ_db[idx], hbr)
     end
     μ_sc_tca, Σ_sc_tca = _grow_belief_to_tca(pomdp, b.sc.μ, b.sc.Σ, pomdp.satParams, t)  # sat exact
     μ_db_tca           = _grow_mean_to_tca(pomdp, b.debris.μ, pomdp.debrisParams, t)     # debris mean-only
-    return chan_pc(μ_sc_tca, μ_db_tca, Σ_sc_tca, table.Σ_db[idx], hbr)
+    return elrod_pc(μ_sc_tca, μ_db_tca, Σ_sc_tca, table.Σ_db[idx], hbr)
 end
 
 """

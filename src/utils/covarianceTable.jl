@@ -165,15 +165,15 @@ end
 """
     pc_through_table(pomdp, sc_eci, debris_eci, table) -> Vector{Float64}
 
-Pc-trust check (Phase 3, folded in from Phase 2): evaluate Chan Pc at each τ in
+Pc-trust check (Phase 3, folded in from Phase 2): evaluate Elrod Pc at each τ in
 `table`, using the propagated ECI covariances Σ(τ) for both objects, for a fixed
 conjunction whose two objects sit at `sc_eci` / `debris_eci` at TCA.
 
-Returns Pc[k] = chan_pc at τ = table.τ_s[k] remaining. As τ → 0 (approaching
+Returns Pc[k] = elrod_pc at τ = table.τ_s[k] remaining. As τ → 0 (approaching
 TCA) the covariance grows toward its TCA magnitude, so Pc should evolve smoothly
 and settle to the at-TCA value — this is the "are the numbers believable" check.
 
-Note: `chan_pc` combines the two objects' ECI covariances in the ECI frame and
+Note: `elrod_pc` combines the two objects' ECI covariances in the ECI frame and
 projects onto the encounter plane, so it needs ECI (GCRF) covariances — we pass
 `Σ_sc_eci` / `Σ_debris_eci`, not the RTN ones.
 """
@@ -184,8 +184,8 @@ function pc_through_table(pomdp::SpacecraftCAPOMDP,
     hbr = pomdp.R_hard_body_sc + pomdp.R_hard_body_debris
     pcs = Vector{Float64}(undef, table.n_steps)
     for k in 1:table.n_steps
-        pcs[k] = chan_pc(collect(sc_eci), collect(debris_eci),
-                         table.Σ_sc_eci[k], table.Σ_debris_eci[k], hbr)
+        pcs[k] = elrod_pc(collect(sc_eci), collect(debris_eci),
+                          table.Σ_sc_eci[k], table.Σ_debris_eci[k], hbr)
     end
     return pcs
 end

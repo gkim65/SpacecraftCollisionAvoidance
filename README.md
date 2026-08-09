@@ -50,10 +50,11 @@ src/
   rewards.jl                       reward (miss-distance baseline; Pc added later)
   utils/
     genConjunctions.jl             Brahe / PyCall setup, conjunction generation
-    computePc.jl                   Pc methods: Chan (1997), Foster, Monte Carlo
+    computePc.jl                   Pc methods: Chan (1997), Elrod (planner default), Foster, Monte Carlo, numeric
     covarianceTable.jl             precomputed Σ(τ) table + Pc-through-Σ(τ) check
     beliefTracker.jl               Kalman predict/correct belief tracker (Phase 4)
-    beliefMCTS.jl                  belief-space MCTS: Pc-at-TCA reward + chance constraint (Phase 5/6)
+    beliefMCTS.jl                  belief-space MCTS: Pc-at-TCA reward (elrod_pc) + chance constraint (Phase 5/6)
+    cdmScenario.jl                 NASA CARA CDM → POMDP scenario loader (real conjunction, near-TCA belief)
   tests/
     test_chan_crossvalidation.jl   Julia-vs-Python Chan cross-validation
     test_conjunction_generator.jl  conjunction geometry + Pc-vs-miss sanity check
@@ -61,6 +62,7 @@ src/
     test_covariance_table.jl       Σ(τ) structure/health/growth + Pc-trust check
     test_belief_tracker.jl         Kalman predict/correct: shrinkage, z-independence, x-val
     test_belief_mcts.jl            MCTS mechanics (UCB/backup/widening/determinism) + Pc reward & chance constraint
+    test_cdm_scenario.jl           CDM loader well-formedness + Pc-at-TCA sanity (payload-vs-payload)
 CONSTANTS.md                       every physical constant + its source
 figures/                           generated figures (local; not tracked in git)
 ```
@@ -360,7 +362,7 @@ julia --project=. src/tests/test_belief_mcts.jl
 156 checks in 14 groups: the five Phase-5 mechanics groups above (**UCB
 selection**, **backup arithmetic**, **progressive widening**, **tree health**,
 **determinism**); five Phase-6 groups — **Pc-at-TCA from a node** (finite, in
-[0,1], matches a direct `chan_pc` on the mean + the node's accumulated Σ propagated
+[0,1], matches a direct `elrod_pc` on the mean + the node's accumulated Σ propagated
 to TCA, and diverges from a fresh-P0 at a deep node); **Pc grows the belief Σ over
 the coast** (a node hours out has an appreciable Pc, a node at TCA is orders of
 magnitude smaller, noting the once-per-orbit ripple); **per-step constraint**
@@ -486,3 +488,43 @@ s0 = CAState(collect(psc.current_state()[1:6]), collect(pdb.current_state()[1:6]
 planner = MCTSPlanner(pomdp; n_iterations = 60, max_depth = 6, dt = pomdp.dt)
 trace   = run_episode(planner, pomdp, s0, MersenneTwister(7))
 ```
+
+### Running the planner on a real NASA conjunction (CDM scenario loader)
+
+`src/utils/cdmScenario.jl` turns a real NASA CARA CDM (Conjunction Data Message)
+into a POMDP scenario the planner can run on, instead of a synthetic fixture.
+`load_cdm_scenario(path)` parses the CDM (via `src/tests/cdmParser.jl`), uses its
+**real TCA covariance directly as the belief** (`P0_sc` = the primary's ECI
+covariance, `P0_debris` = the secondary's), preserves the **real hard-body radius**
+from the CDM's `COMMENT HBR` (put entirely on `R_hard_body_sc`, since every Pc call
+uses only the sum — CDMs carry a single combined HBR), tags the secondary's class
+(`classify_secondary`), and flags whether the case is a 2D-Pc **usage violation**
+(`usageViolationCurvilinear.jl`, the 53/53-exact detector). The planning **horizon**
+is the CDM's own lead time (`CREATION_DATE` → `TCA`).
+
+This is a **near-TCA** scenario: the CDM covariance *is* the belief at the root
+(operationally defensible — operators decide using the latest CDM's covariance).
+The detection→TCA back-propagation that would seed an evolving belief is a later
+"covariance fix" — until then, `node_pc_at_tca` grows the near-TCA belief *forward*
+to TCA, which is only physically the conjunction at τ→0. Evaluated **at TCA**,
+`elrod_pc` on the loaded CDM reproduces NASA's operational Pc to ~0.02% (SWIFT vs
+JILIN-01 GAOFEN 2A: elrod 2.324e-3 vs CARA 2.324e-3).
+
+```julia
+include("src/SpacecraftCollisionAvoidance.jl")   # + Brahe deps, as elsewhere
+
+cdm = "data/cara_cdms/000028485_conj_000044777_20220407_231108_20220406_140506.cdm"
+sc  = load_cdm_scenario(cdm)     # SWIFT vs JILIN-01 GAOFEN 2A, payload-vs-payload
+# sc.pomdp / sc.b0 / sc.s_true / sc.t_horizon feed the planner; sc.sec_class,
+# sc.valid (no usage violation), sc.hbr, sc.pc_cdm carry the provenance.
+```
+
+```bash
+julia --project=. src/tests/test_cdm_scenario.jl
+```
+
+Loads the clean payload-vs-payload case and asserts the scenario is well-formed
+(finite states, positive-definite belief covariances, HBR preserved from the CDM,
+secondary class tagged `:payload`, validity flag set, horizon = the CDM's lead
+time) and that `elrod_pc` at TCA matches CARA's operational Pc. The end-to-end
+`plan` assertion is skipped pending the covariance fix (see the test's TODO).
