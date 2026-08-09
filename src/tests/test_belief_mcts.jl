@@ -312,6 +312,10 @@ end
 
     # -----------------------------------------------------------------
     @testset "8. Per-step chance constraint fires above / not below threshold" begin
+        # NB this testset covers the LEGACY :per_step reward (the per-step Pc term +
+        # per-step violation penalty), so it passes reward_mode = :per_step
+        # explicitly. The DEFAULT is now :terminal (Pc charged at the leaf, per-step
+        # reward = fuel only) — covered by testset 8b below.
         pomdp = SpacecraftCAPOMDP(seed = 42, randAdd = false, dt = 60 * 60,
                                   TCA_max = 3 * 60 * 60)
         s0 = make_conjunction_state(pomdp; miss_m = 500.0, v_rel = 15.0,
@@ -323,12 +327,14 @@ end
         pomdp_lo = SpacecraftCAPOMDP(seed = 42, randAdd = false, dt = 60 * 60,
                                      TCA_max = 3 * 60 * 60, pc_threshold = pc / 2)
         nlo = root_from_pomdp(pomdp_lo, s0)
-        r_pen, pc_lo, viol_pen = step_reward(pomdp_lo, WAIT, nlo; constraint_mode = :penalize)
+        r_pen, pc_lo, viol_pen = step_reward(pomdp_lo, WAIT, nlo;
+                                             reward_mode = :per_step, constraint_mode = :penalize)
         @test viol_pen == true
         @test pc_lo ≈ pc rtol = 1e-9
         # penalize reward = −weight·pc − penalty ; off = −weight·pc (no penalty)
         nlo_off = root_from_pomdp(pomdp_lo, s0)
-        r_off, _, viol_off = step_reward(pomdp_lo, WAIT, nlo_off; constraint_mode = :off)
+        r_off, _, viol_off = step_reward(pomdp_lo, WAIT, nlo_off;
+                                         reward_mode = :per_step, constraint_mode = :off)
         @test viol_off == true                          # still flagged...
         @test r_off ≈ r_pen + MCTS_PC_VIOLATION_PENALTY  # ...but no penalty applied
         @test r_pen < r_off                              # penalize is worse by exactly the penalty
@@ -337,18 +343,60 @@ end
         pomdp_hi = SpacecraftCAPOMDP(seed = 42, randAdd = false, dt = 60 * 60,
                                      TCA_max = 3 * 60 * 60, pc_threshold = pc * 2)
         nhi = root_from_pomdp(pomdp_hi, s0)
-        r_hi, _, viol_hi = step_reward(pomdp_hi, WAIT, nhi; constraint_mode = :penalize)
+        r_hi, _, viol_hi = step_reward(pomdp_hi, WAIT, nhi;
+                                       reward_mode = :per_step, constraint_mode = :penalize)
         @test viol_hi == false
         @test r_hi ≈ -MCTS_PC_REWARD_WEIGHT * pc          # only the Pc term (WAIT, no fuel)
 
         # Case C: :terminate marks a violating child terminal inside expand_child.
         nterm = root_from_pomdp(pomdp_lo, s0)
         child, _ = expand_child(pomdp_lo, nterm, WAIT, MersenneTwister(0);
-                                dt = pomdp_lo.dt, constraint_mode = :terminate)
+                                dt = pomdp_lo.dt, reward_mode = :per_step,
+                                constraint_mode = :terminate)
         @test child.violated == (child.pc > pomdp_lo.pc_threshold)
         if child.violated
             @test child.is_terminal == true
         end
+    end
+
+    # -----------------------------------------------------------------
+    @testset "8b. Terminal-only Pc reward (:terminal, the default)" begin
+        # The redesign default (2026-08-09): per-step reward is FUEL COST ONLY (no
+        # Pc term, no per-step violation penalty); the whole Pc term + a SOFT over-δ
+        # penalty live in leaf_value at TCA.
+        pomdp = SpacecraftCAPOMDP(seed = 42, randAdd = false, dt = 60 * 60,
+                                  TCA_max = 3 * 60 * 60)
+        s0 = make_conjunction_state(pomdp; miss_m = 500.0, v_rel = 15.0,
+                                    geometry = :cross_track, t = 2 * 60 * 60)
+        pc = node_pc_at_tca(pomdp, root_from_pomdp(pomdp, s0))
+
+        # Force a violation (threshold below pc). Per-STEP reward is fuel-only
+        # regardless of the violation: WAIT ⇒ 0, MANEUVER ⇒ −maneuver_cost.
+        plo = SpacecraftCAPOMDP(seed = 42, randAdd = false, dt = 60 * 60,
+                                TCA_max = 3 * 60 * 60, pc_threshold = pc / 2)
+        r_w, pc_w, viol_w = step_reward(plo, WAIT, root_from_pomdp(plo, s0);
+                                        reward_mode = :terminal, constraint_mode = :penalize)
+        r_m, _,    _      = step_reward(plo, MANEUVER, root_from_pomdp(plo, s0);
+                                        reward_mode = :terminal, constraint_mode = :penalize)
+        @test viol_w == true                 # still FLAGGED (pc cached), just not charged per step
+        @test pc_w ≈ pc rtol = 1e-9
+        @test r_w ≈ 0.0                       # WAIT: no Pc term, no fuel
+        @test r_m ≈ -plo.maneuver_cost        # MANEUVER: fuel only
+
+        # leaf_value carries the terminal Pc term + the SOFT over-δ penalty.
+        leaf_v = BeliefNode(root_from_pomdp(plo, s0).belief, s0, false)
+        v_viol = leaf_value(plo, leaf_v; reward_mode = :terminal, constraint_mode = :penalize)
+        @test v_viol ≈ -MCTS_PC_REWARD_WEIGHT * pc - MCTS_TERMINAL_PENALTY
+        # :off suppresses the soft penalty (no-constraint arm).
+        leaf_o = BeliefNode(root_from_pomdp(plo, s0).belief, s0, false)
+        v_off  = leaf_value(plo, leaf_o; reward_mode = :terminal, constraint_mode = :off)
+        @test v_off ≈ -MCTS_PC_REWARD_WEIGHT * pc
+        # Feasible leaf (threshold above pc): no over-δ penalty.
+        phi = SpacecraftCAPOMDP(seed = 42, randAdd = false, dt = 60 * 60,
+                                TCA_max = 3 * 60 * 60, pc_threshold = pc * 2)
+        leaf_f = BeliefNode(root_from_pomdp(phi, s0).belief, s0, false)
+        v_feas = leaf_value(phi, leaf_f; reward_mode = :terminal, constraint_mode = :penalize)
+        @test v_feas ≈ -MCTS_PC_REWARD_WEIGHT * pc
     end
 
     # -----------------------------------------------------------------

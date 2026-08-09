@@ -116,6 +116,34 @@ const MCTS_PC_REWARD_WEIGHT    = 1.0e6    # reward = −weight·Pc (at-threshold
 const MCTS_PC_VIOLATION_PENALTY = 100.0   # penalty when Pc > threshold (≫ maneuver_cost)
 const MCTS_CONSTRAINT_MODE     = :penalize   # :penalize | :terminate | :off
 
+# --- REWARD MODE (2026-08-09 redesign; see CONSTANTS.md + the REWARD section) ---
+# Selects WHERE the Pc term is charged (the over-maneuvering fix, memory
+# chance-constraint-framing-tension + the root_decision_probe diagnostic):
+#   :per_step (LEGACY) — charge −pc_weight·Pc at EVERY step and sum it down the
+#       path (the original Phase-6 shaping). Punishes a branch for its wide EARLY
+#       belief even when measurement resolves it by TCA → sinks the wait-and-measure
+#       branch (Q(WAIT) ≈ −19.5k vs Q(MANEUVER) ≈ −13 on SWIFT/JILIN). Kept for the
+#       ablation + the synthetic suites.
+#   :terminal (DEFAULT) — Pc is a TERMINAL quantity: the per-step reward is fuel
+#       cost ONLY (no Pc term), and the WHOLE Pc term lives in `leaf_value` at TCA.
+#       A branch is valued by its Pc-AT-TCA (the resolved outcome), not the summed
+#       early-belief Pc it passed through — so WAIT-that-goes-safe (fuel 0,
+#       Pc→~1e-12) beats MANEUVER (fuel>0) on a feasible case. This is standard
+#       chance-constrained planning (trajectory feasibility, not a running penalty)
+#       and sharpens the ACAS-X parallel (reason about the resolved event).
+const MCTS_REWARD_MODE = :terminal        # :terminal (default) | :per_step (legacy)
+
+# Terminal soft over-δ penalty (only in :terminal mode). A leaf whose Pc-at-TCA
+# exceeds pomdp.pc_threshold takes this flat penalty ON TOP of −pc_weight·Pc — a
+# SOFT terminal constraint: a barely-over branch is still COMPARED (ranked by its
+# Pc), not amputated, so the search can still prefer the least-infeasible option
+# when NO feasible one exists (the debris control case correctly stays MANEUVER).
+# Sized ≫ the per-step maneuver_cost (10) and ≫ a feasible branch's −pc_weight·Pc
+# (≤ pc_weight·δ = 1e6·1e-5 = 10) so crossing δ always dominates a fuel burn, i.e.
+# the constraint binds. TODO: needs source (a tuning knob, like pc_weight /
+# maneuver_cost; scaled to bind at δ, not an independently-measured quantity).
+const MCTS_TERMINAL_PENALTY = 1.0e4       # flat penalty when leaf Pc-at-TCA > threshold
+
 # Σ-propagation mode for the Pc eval (efficiency pass, 2026-07-23):
 #   :fast  — precompute the branch-invariant DEBRIS Σ-at-TCA per depth ONCE per
 #            plan, look it up per node; propagate only the debris MEAN + the full
@@ -137,6 +165,253 @@ const MCTS_SIGMA_MODE = :fast
 #                     `nothing` ⇒ use all currently-attached Distributed workers.
 const MCTS_PARALLEL  = false
 const MCTS_N_WORKERS = nothing
+
+# =========================================================================
+# ADAPTIVE EVENT-DRIVEN DECISION GRID (2026-08-09 redesign, Part 2).
+#
+# WHY: the fixed-dt grid plans at ~33 uniform steps over a 33 h horizon (~263 s /
+# plan) and, worse, makes the TERMINAL Pc reward ineffective — a full-depth rollout
+# rarely reaches TCA within the depth budget, so the leaf value at TCA is seldom
+# seen. Between measurements, though, the belief only GROWS deterministically
+# (predict, Σ⁻ = Φ Σ Φᵀ); nothing DECISION-relevant happens, so planning there is
+# wasted. This grid instead jumps epoch→epoch, where a decision epoch is a
+# MEASUREMENT time (per the class cadence) plus TCA. A rollout then reaches TCA in
+# a handful of steps → leaves are cheap AND actually reached → the terminal reward
+# works. The two redesign parts are mutually enabling.
+#
+# WHAT IT IS: plain DATA the caller builds and hands to the planner, so timings are
+# fully swappable per run and can be NON-UNIFORM along the horizon (coarse far from
+# TCA, fine near it). `grid === nothing` ⇒ the legacy fixed-dt / cadence-timer path,
+# byte-for-byte unchanged (the synthetic suites' path). The executor re-plans every
+# executed step (receding horizon), so rebuilding the grid from the CURRENT
+# time-to-TCA each step makes it adapt as the episode marches down the horizon.
+#
+# STRUCTURE: a node at tree DEPTH d (root = 0) sits at epoch `t_epochs[d+1]` (time
+# remaining). Taking an action steps to depth d+1 by predicting over the gap
+# `dts[d+1] = t_epochs[d+1] − t_epochs[d+2]`, then correcting the object(s) whose
+# measurement lands at the new epoch (`correct_sc[d+1]` / `correct_debris[d+1]`).
+# The last epoch is 0 (TCA), so a rollout that runs to the grid's end IS at TCA.
+# MANEUVER is available at every epoch (the burn-candidate rule Grace chose for now;
+# adaptive burn density is a later layer).
+# =========================================================================
+
+"""
+    DecisionGrid
+
+An adaptive event-driven decision schedule for one `plan` call. Element `i`
+(1-based, `i = depth + 1`) describes the STEP taken FROM depth `d = i-1`:
+`dts[i]` is the time gap (s) to the next epoch, and `correct_sc[i]` /
+`correct_debris[i]` say whether the spacecraft / debris gets a measurement
+correction at the epoch reached by that step. `t_epochs` lists the epoch
+time-remaining values (descending, ending at 0 = TCA) for reference / logging;
+`t_epochs[i]` is the time-remaining at depth `i-1`. Build one with
+`decision_grid` (auto-generated from cadences, optionally non-uniform) or
+construct directly for a fully-custom schedule. Length of `dts`/`correct_*` is
+`length(t_epochs) - 1` (one step between each pair of epochs).
+"""
+struct DecisionGrid
+    t_epochs::Vector{Float64}     # epoch time-remaining (s), descending, last = 0
+    dts::Vector{Float64}          # step gap (s) from depth d to d+1
+    correct_sc::Vector{Bool}      # sc measurement lands at the epoch reached
+    correct_debris::Vector{Bool}  # debris measurement lands at the epoch reached
+end
+
+"""
+    grid_depth_count(grid) -> Int
+
+Number of steps (== max usable tree depth) the grid defines: `length(grid.dts)`.
+A rollout of this many steps from the root reaches the final epoch (TCA).
+"""
+grid_depth_count(grid::DecisionGrid) = length(grid.dts)
+
+"""
+    decision_grid(horizon; cadence_secondary, schedule=nothing, atol=1.0) -> DecisionGrid
+
+Auto-generate an event-driven `DecisionGrid` over `[horizon, 0]` (time-remaining,
+s). The model (Grace 2026-08-09): the PRIMARY is the own asset with continuous
+GPS-level tracking — it is not an *event*, so it does NOT define decision epochs;
+its belief stays tight and it is simply corrected at EVERY epoch. The SECONDARY
+(the risky object) is measured on its class ground-pass cadence, and THOSE
+measurement times ARE the events a decision should react to. So:
+
+    decision epochs = the SECONDARY's measurement times + TCA
+    correct_sc = true at every epoch     (continuous GPS primary)
+    correct_db = true at every epoch     (each epoch IS a secondary measurement)
+
+`cadence_secondary` (s) is the secondary's measurement cadence (its class value —
+payload ~2 h, debris/RB ~8 h). Epochs land at `H, H−cad, H−2·cad, …, 0`. Pass a
+`schedule` (a vector of `(t_lo, t_hi) => Δt` pairs, s) instead for a NON-UNIFORM
+secondary schedule along the horizon (e.g. denser near TCA); the first matching
+interval (`t_lo ≤ t < t_hi`) sets the local gap. `atol` (s) merges epochs closer
+than that (avoids a degenerate ~0-length step). For a fully-custom schedule,
+construct a `DecisionGrid` directly.
+"""
+function decision_grid(horizon::Real;
+                       cadence_secondary::Union{Real,Nothing} = nothing,
+                       schedule::Union{AbstractVector,Nothing} = nothing,
+                       atol::Real = 1.0)
+    H = Float64(horizon)
+    H > 0 || error("decision_grid: horizon must be positive (got $H)")
+
+    # local secondary-cadence gap at time-remaining t (schedule wins over scalar).
+    function step_at(t::Float64)
+        if schedule !== nothing
+            for (rng, Δt) in schedule
+                lo, hi = Float64(rng[1]), Float64(rng[2])
+                lo <= t < hi && return Float64(Δt)
+            end
+            error("decision_grid: schedule does not cover time-remaining $t")
+        end
+        cadence_secondary === nothing &&
+            error("decision_grid: pass `cadence_secondary` or `schedule`")
+        return Float64(cadence_secondary)
+    end
+
+    # Epochs = the secondary's measurement times, walking DOWN from H toward TCA.
+    epochs = Float64[H]
+    t = H
+    guard = 0
+    while t > atol
+        Δt = step_at(t)
+        Δt > 0 || error("decision_grid: non-positive cadence gap $Δt at t=$t")
+        t = max(0.0, t - Δt)
+        (t <= atol || abs(epochs[end] - t) > atol) && push!(epochs, t)
+        guard += 1
+        guard > 100_000 && error("decision_grid: too many epochs (cadence too small?)")
+    end
+    epochs[end] > atol && push!(epochs, 0.0)   # ensure TCA is the final epoch
+
+    # Every epoch IS a secondary measurement, and the continuous primary is fixed at
+    # every epoch too → both correction flags are true on every step.
+    n = length(epochs)
+    dts = Float64[epochs[i] - epochs[i + 1] for i in 1:(n - 1)]
+    csc = trues(n - 1)
+    cdb = trues(n - 1)
+    return DecisionGrid(epochs, dts, csc, cdb)
+end
+
+"""
+    wait_spine_pc(pomdp, b0, s_true, epochs) -> Vector{Float64}
+
+Compute Pc-at-TCA along the WAIT spine at each epoch in `epochs` (descending
+time-remaining, the first entry = the root). Walks `predict → correct(both, every
+epoch)` from `b0` — the SAME schedule the grid uses — and evaluates
+`node_pc_at_tca` at each. z-independent Σ update ⇒ a zero-innovation observation
+(`z = μ⁻`) gives the exact belief Σ. Cheap (no MCTS): one propagation chain of
+`length(epochs)` steps. This is the CROSSING DETECTOR the adaptive grid probes
+with — it reveals WHERE (if anywhere) WAIT's Pc crosses the threshold, so the grid
+can refine only there. Returns a Pc per epoch (`length(epochs)` entries).
+"""
+function wait_spine_pc(pomdp::SpacecraftCAPOMDP, b0::Belief, s_true::CAState,
+                       epochs::AbstractVector{<:Real})
+    pcs = Float64[]
+    b = b0
+    n0 = BeliefNode(b, s_true, isterminal(pomdp, s_true))
+    push!(pcs, node_pc_at_tca(pomdp, n0))
+    for i in 1:(length(epochs) - 1)
+        dt = Float64(epochs[i]) - Float64(epochs[i + 1])
+        b = predict(pomdp, b, WAIT; dt = dt)
+        z = vcat(b.sc.μ, b.debris.μ)                 # zero-innovation (Σ⁺ z-independent)
+        b = correct_linear_sc(pomdp, b, z)
+        b = correct_linear_debris(pomdp, b, z)
+        nd = BeliefNode(b, s_true, false)
+        push!(pcs, node_pc_at_tca(pomdp, nd))
+    end
+    return pcs
+end
+
+"""
+    adaptive_decision_grid(pomdp, b0, s_true, horizon; cadence_secondary,
+                           coarse=cadence_secondary, fine=cadence_secondary,
+                           truncate_safe=false, safe_margin=coarse,
+                           safe_factor=1e3, atol=1.0) -> (DecisionGrid, crossing_t)
+
+Build a CROSSING-ADAPTIVE grid: probe the WAIT spine at the `coarse` cadence to
+find where WAIT's Pc-at-TCA crosses below `pomdp.pc_threshold` (the WAIT-becomes-
+safe point), then build the real grid COARSE everywhere EXCEPT a bracket around
+that crossing, where it uses the `fine` step. This is self-tuning per case: a
+DEBRIS case whose Pc never crosses stays coarse everywhere (few steps, fast);
+a payload case densifies only around its crossing (cheap + captures the
+decision-relevant region). Returns the grid and the crossing time-remaining
+(`NaN` if no crossing — grid is uniformly coarse).
+
+Refinement bracket = `[t_x + coarse, t_x − coarse]` (one coarse step on each side
+of the crossing epoch `t_x`), filled at the `fine` cadence; outside it the coarse
+cadence. Both correction flags are true every epoch (primary continuous; each
+epoch a secondary measurement), same as `decision_grid`.
+
+`truncate_safe` (PURE-EFFICIENCY, value-preserving — distinct from the deferred
+provably-infeasible PRUNE, which is CONSTRAINT logic that CHANGES decisions): once
+the WAIT-spine Pc is DEEPLY safe (`< pc_threshold / safe_factor`) AND monotone-
+decreasing, further expansion cannot change any branch's terminal value (Pc only
+falls further to TCA — verified monotone past the crossing on well-tracked cases,
+maneuver_effectiveness_findings). So the grid STOPS at the first such epoch plus a
+`safe_margin` cushion; the leaf THERE still evaluates Pc-at-TCA (propagated to TCA
+regardless of node position — the `:coast` leaf), so the terminal quantity is
+preserved. This ONLY saves compute after the decision is settled; it does not
+prune infeasible branches and does not alter Q (up to the monotone assumption).
+Default `false` (full depth to TCA). NB monotonicity is the guard — if a case's Pc
+straddles the threshold (a ripple regime), leave `truncate_safe=false`.
+"""
+function adaptive_decision_grid(pomdp::SpacecraftCAPOMDP, b0::Belief,
+                                s_true::CAState, horizon::Real;
+                                cadence_secondary::Real,
+                                coarse::Real = cadence_secondary,
+                                fine::Real = cadence_secondary,
+                                truncate_safe::Bool = false,
+                                safe_margin::Real = coarse,
+                                safe_factor::Real = 1e3,
+                                atol::Real = 1.0)
+    H = Float64(horizon)
+    coarse = Float64(coarse); fine = Float64(fine)
+
+    # 1. coarse probe epochs (secondary-cadence spine at the coarse step).
+    probe = decision_grid(H; cadence_secondary = coarse, atol = atol)
+    te = probe.t_epochs
+    pcs = wait_spine_pc(pomdp, b0, s_true, te)
+
+    # 2. find the crossing: first epoch where Pc drops to/below threshold.
+    thr = pomdp.pc_threshold
+    xi = findfirst(p -> p <= thr, pcs)
+    if xi === nothing || xi == 1
+        # never crosses (debris) — or already safe at root: uniform coarse grid.
+        return probe, NaN
+    end
+    t_x = te[xi]                       # crossing epoch (time-remaining)
+
+    # 2b. EFFICIENCY TRUNCATION (value-preserving; see docstring). Find the first
+    # epoch where Pc is DEEPLY safe AND monotone-decreasing from there; stop the
+    # horizon a `safe_margin` past it. Guard: require the tail from that epoch to be
+    # non-increasing (no straddle) — else do not truncate.
+    t_stop = 0.0
+    if truncate_safe
+        deep = thr / Float64(safe_factor)
+        si = findfirst(i -> pcs[i] < deep, eachindex(pcs))
+        if si !== nothing && si < length(pcs)
+            tail = pcs[si:end]
+            monotone = all(tail[j + 1] <= tail[j] + eps() for j in 1:(length(tail) - 1))
+            monotone && (t_stop = max(0.0, te[si] - Float64(safe_margin)))
+        end
+    end
+
+    # 3. build the refined epoch set: coarse everywhere, fine in the bracket
+    #    [t_x + coarse, t_x − coarse]. Walk down from H at the local step, stopping
+    #    at `t_stop` (0.0 = full depth to TCA when not truncating).
+    lo = max(0.0, t_x - coarse); hi = t_x + coarse
+    epochs = Float64[H]; t = H; guard = 0
+    while t > t_stop + atol
+        step = (t <= hi + atol && t >= lo - atol) ? fine : coarse
+        t = max(t_stop, t - step)
+        (abs(t - t_stop) <= atol || abs(epochs[end] - t) > atol) && push!(epochs, t)
+        guard += 1; guard > 100_000 && error("adaptive_decision_grid: too many epochs")
+    end
+    # ensure the final epoch is exactly t_stop (TCA=0 in the non-truncating case).
+    abs(epochs[end] - t_stop) > atol && push!(epochs, t_stop)
+
+    n = length(epochs)
+    dts = Float64[epochs[i] - epochs[i + 1] for i in 1:(n - 1)]
+    return DecisionGrid(epochs, dts, trues(n - 1), trues(n - 1)), t_x
+end
 
 # =========================================================================
 # Tree node.  Reuses Phase 4's `Belief` (two 6×6 sub-beliefs + time-remaining)
@@ -540,7 +815,8 @@ function build_sigma_tca_table(pomdp::SpacecraftCAPOMDP, root::BeliefNode;
                                dt::Real = pomdp.dt,
                                cadence_sc::Real = pomdp.cadence_sc,
                                cadence_debris::Real = pomdp.cadence_debris,
-                               max_depth::Int = MCTS_MAX_DEPTH)
+                               max_depth::Int = MCTS_MAX_DEPTH,
+                               grid::Union{DecisionGrid,Nothing} = nothing)
     Σ_db = Matrix{Float64}[]
 
     b = root.belief
@@ -551,18 +827,29 @@ function build_sigma_tca_table(pomdp::SpacecraftCAPOMDP, root::BeliefNode;
     push!(Σ_db, b.t <= PC_TAU_MATCH_ATOL ? Matrix(b.debris.Σ) :
           _grow_sigma_to_tca(pomdp, b.debris.μ, b.debris.Σ, pomdp.debrisParams, b.t))
 
-    for _ in 1:max_depth
-        # PREDICT one dt step along the WAIT spine (a == WAIT: no maneuver kick;
-        # Σ grows regardless of action, so WAIT is the right reference).
-        b = predict(pomdp, b, WAIT; dt = dt)
+    # On the adaptive grid the debris Σ per depth is STILL branch-invariant (the
+    # predict/correct schedule is a pure function of depth via the grid), so the
+    # same WAIT-spine replay works — but the step size and which object is corrected
+    # come from the grid at each depth instead of a fixed dt + cadence timers.
+    n_steps = grid === nothing ? max_depth : min(max_depth, grid_depth_count(grid))
 
-        # asymmetric cadence: correct the object(s) whose fix is due this step.
-        # Σ⁺ = (I−K)Σ⁻ is z-independent, so a zero-innovation z (= μ⁻) gives the
-        # exact tree Σ while keeping the reference mean on the WAIT trajectory.
-        since_sc     += Float64(dt)
-        since_debris += Float64(dt)
-        correct_sc     = since_sc     >= cadence_sc
-        correct_debris = since_debris >= cadence_debris
+    for d in 1:n_steps
+        step_dt = grid === nothing ? Float64(dt) : grid.dts[d]
+        # PREDICT one step along the WAIT spine (Σ grows regardless of action).
+        b = predict(pomdp, b, WAIT; dt = step_dt)
+
+        # Which object is corrected this step: grid flags on the adaptive path,
+        # cadence timers on the fixed path. Σ⁺ = (I−K)Σ⁻ is z-independent, so a
+        # zero-innovation z (= μ⁻) gives the exact tree Σ.
+        if grid === nothing
+            since_sc     += Float64(dt)
+            since_debris += Float64(dt)
+            correct_sc     = since_sc     >= cadence_sc
+            correct_debris = since_debris >= cadence_debris
+        else
+            correct_sc     = grid.correct_sc[d]
+            correct_debris = grid.correct_debris[d]
+        end
         if correct_sc || correct_debris
             z = vcat(b.sc.μ, b.debris.μ)      # zero-innovation observation
             if correct_sc
@@ -674,9 +961,28 @@ function step_reward(pomdp::SpacecraftCAPOMDP, a::CAAction, child::BeliefNode;
                      constraint_mode::Symbol = MCTS_CONSTRAINT_MODE,
                      pc_weight::Real = MCTS_PC_REWARD_WEIGHT,
                      pc_penalty::Real = MCTS_PC_VIOLATION_PENALTY,
+                     reward_mode::Symbol = MCTS_REWARD_MODE,
                      depth::Union{Int,Nothing} = nothing,
                      table::Union{SigmaTCATable,Nothing} = nothing,
                      sigma_mode::Symbol = MCTS_SIGMA_MODE)
+    # --- :terminal (default) — per-step reward is FUEL COST ONLY. No Pc term and
+    # no per-step violation penalty: Pc is a TERMINAL quantity charged once in
+    # `leaf_value` at TCA (the over-maneuvering fix). We still compute + cache the
+    # child's Pc / violation flag for the tree instrumentation (and so :terminate
+    # can amputate on it if a caller opts in), but they do NOT enter the reward.
+    if reward_mode == :terminal
+        pc = isnan(child.pc) ?
+             node_pc(pomdp, child; depth = depth, table = table, sigma_mode = sigma_mode) :
+             child.pc
+        child.pc = pc
+        violated = pc > pomdp.pc_threshold
+        child.violated = violated
+        r = a == MANEUVER ? -Float64(pomdp.maneuver_cost) : 0.0
+        return r, pc, violated
+    end
+
+    # --- :per_step (legacy) — charge −pc_weight·Pc every step + the per-step
+    # violation penalty (the original Phase-6 path-summed shaping).
     pc = isnan(child.pc) ?
          node_pc(pomdp, child; depth = depth, table = table, sigma_mode = sigma_mode) :
          child.pc
@@ -743,6 +1049,58 @@ should_widen(n_children::Int, na::Int; k::Real = MCTS_K_OBS, α::Real = MCTS_ALP
     n_children <= k * (max(na, 1)^α)
 
 # =========================================================================
+# VARIABLE-dt TRUE-STATE TRANSITION (adaptive grid, Part 2).
+#
+# `POMDPs.transition` (transitions.jl) hardcodes the step at `pomdp.dt`. On the
+# adaptive grid the true state must advance by the SAME variable epoch gap the
+# belief does, so the truth and belief stay on one timeline (the executor's
+# dt-consistency invariant). `transition_dt` is `POMDPs.transition` with an
+# explicit `dt`: apply the maneuver Δv kick (identical convention), propagate both
+# objects forward by `dt` under the accurate force model, and return a Deterministic
+# next CAState. When `dt == pomdp.dt` it is exactly `POMDPs.transition`.
+# =========================================================================
+
+"""
+    transition_dt(pomdp, s::CAState, a::CAAction, dt) -> Deterministic(CAState)
+
+Advance the true state `s` by `dt` seconds under action `a` (same dynamics /
+maneuver convention as `POMDPs.transition`, which is the `dt == pomdp.dt` case).
+Used by the adaptive-grid MCTS so the true state steps by the variable epoch gap.
+"""
+function transition_dt(pomdp::SpacecraftCAPOMDP, s::CAState, a::CAAction, dt::Real)
+    isterminal(pomdp, s) && return Deterministic(s)
+    bh = get_brahe()
+    epoch_tca     = bh.Epoch.from_datetime(pomdp.epochTCA..., bh.TimeSystem.UTC)
+    epoch_current = epoch_tca - s.t
+    epoch_next    = epoch_tca - (s.t - Float64(dt))
+
+    sc_eci_start = copy(s.sc_eci)
+    if a == MANEUVER
+        v     = sc_eci_start[4:6]
+        v_hat = v / norm(v)
+        sc_eci_start[4:6] += pomdp.Δv * v_hat
+    end
+
+    epoch_current_tuple = epoch_to_tuple(epoch_current)
+    prop_sc, _     = eci2orb_brahe(sc_eci_start, epoch_current_tuple,
+                                   pomdp.satParams, pomdp.forceModel)
+    prop_debris, _ = eci2orb_brahe(s.debris_eci, epoch_current_tuple,
+                                   pomdp.debrisParams, pomdp.forceModel)
+    prop_sc.propagate_to(epoch_next)
+    prop_debris.propagate_to(epoch_next)
+
+    sc_eci_next     = collect(prop_sc.current_state()[1:6])
+    debris_eci_next = collect(prop_debris.current_state()[1:6])
+
+    t_next     = s.t - Float64(dt)
+    R_combined = pomdp.R_hard_body_sc + pomdp.R_hard_body_debris
+    x_rel_next = collect(bh.state_eci_to_rtn(sc_eci_next, debris_eci_next))
+    terminal   = t_next <= 0.0 || norm(x_rel_next[1:3]) < R_combined
+
+    return Deterministic(CAState(sc_eci_next, debris_eci_next, t_next, terminal))
+end
+
+# =========================================================================
 # SHARED per-step belief update (predict → asymmetric cadence correct).
 #
 # This is the single source of truth for "advance a belief one dt step under an
@@ -780,7 +1138,29 @@ function step_belief(pomdp::SpacecraftCAPOMDP, b::Belief, a::CAAction,
                      dt::Real = pomdp.dt,
                      cadence_sc::Real = pomdp.cadence_sc,
                      cadence_debris::Real = pomdp.cadence_debris,
-                     since_sc::Real, since_debris::Real)
+                     since_sc::Real, since_debris::Real,
+                     grid::Union{DecisionGrid,Nothing} = nothing,
+                     grid_depth::Union{Int,Nothing} = nothing)
+    # ADAPTIVE GRID PATH: the step size and which object(s) are corrected come from
+    # `grid` at this depth, not from the cadence timers. `grid_depth` is the CHILD's
+    # tree depth (root child = 1); the step from parent depth d to child depth d+1
+    # uses grid index d+1 == grid_depth. predict over that variable gap, then
+    # correct the object(s) whose measurement lands at the reached epoch. Timers are
+    # not used on this path (kept unchanged, so a mixed caller is well-defined).
+    if grid !== nothing && grid_depth !== nothing && grid_depth >= 1 &&
+       grid_depth <= grid_depth_count(grid)
+        gdt = grid.dts[grid_depth]
+        b = predict(pomdp, b, a; dt = gdt)
+        do_sc = grid.correct_sc[grid_depth]
+        do_db = grid.correct_debris[grid_depth]
+        if do_sc || do_db
+            z = sample_observation(pomdp, a, s_true_next, rng)
+            do_sc && (b = correct_linear_sc(pomdp, b, z))
+            do_db && (b = correct_linear_debris(pomdp, b, z))
+        end
+        return b, since_sc, since_debris   # timers untouched on the grid path
+    end
+
     # predict the belief forward one dt step (Phase 4). Σ GROWS this step.
     b = predict(pomdp, b, a; dt = dt)
 
@@ -843,28 +1223,40 @@ function expand_child(pomdp::SpacecraftCAPOMDP, node::BeliefNode, a::CAAction,
                       constraint_mode::Symbol = MCTS_CONSTRAINT_MODE,
                       pc_weight::Real = MCTS_PC_REWARD_WEIGHT,
                       pc_penalty::Real = MCTS_PC_VIOLATION_PENALTY,
+                      reward_mode::Symbol = MCTS_REWARD_MODE,
                       depth::Union{Int,Nothing} = nothing,
                       table::Union{SigmaTCATable,Nothing} = nothing,
-                      sigma_mode::Symbol = MCTS_SIGMA_MODE)
-    # 1. propagate the sampled true state (Phase 0 dynamics)
-    sp = rand(rng, POMDPs.transition(pomdp, node.s_true, a))
+                      sigma_mode::Symbol = MCTS_SIGMA_MODE,
+                      grid::Union{DecisionGrid,Nothing} = nothing)
+    # 1. propagate the sampled true state (Phase 0 dynamics). On the adaptive grid
+    #    the true state advances by the SAME variable epoch gap the belief does, so
+    #    the truth and belief stay on one timeline (see DECISION GRID). `depth` is
+    #    the child's tree depth, i.e. grid index d+1.
+    eff_dt = (grid !== nothing && depth !== nothing && depth >= 1 &&
+              depth <= grid_depth_count(grid)) ? grid.dts[depth] : Float64(dt)
+    sp = rand(rng, transition_dt(pomdp, node.s_true, a, eff_dt))
 
-    # 2–4. predict + asymmetric-cadence correct — the SHARED per-step belief
-    # update (see `step_belief`). The executor calls the SAME helper, so the
-    # in-tree belief and the real-world belief evolve by identical code.
+    # 2–4. predict + measurement correct over this step — the SHARED per-step
+    # belief update (see `step_belief`). On the fixed grid (grid === nothing) the
+    # asymmetric cadence timers decide which object is fixed; on the adaptive grid
+    # the correction is dictated by `grid` at this depth (which epoch = which fix).
     b, since_sc, since_debris = step_belief(pomdp, node.belief, a, sp, rng;
                                             dt = dt, cadence_sc = cadence_sc,
                                             cadence_debris = cadence_debris,
                                             since_sc = node.since_sc,
-                                            since_debris = node.since_debris)
+                                            since_debris = node.since_debris,
+                                            grid = grid, grid_depth = depth)
 
     child = BeliefNode(b, sp, isterminal(pomdp, sp);
                        since_sc = since_sc, since_debris = since_debris)
 
-    # 5–6. Pc-at-TCA + per-step chance constraint (§4 step 6). Caches pc/violated.
+    # 5–6. Pc-at-TCA + reward. Under :terminal the step reward is fuel-only and Pc
+    # is charged at the leaf; under :per_step this applies the legacy shaping +
+    # per-step constraint. Either way the child's pc/violated are cached.
     r, _, violated = step_reward(pomdp, a, child;
                                  constraint_mode = constraint_mode,
                                  pc_weight = pc_weight, pc_penalty = pc_penalty,
+                                 reward_mode = reward_mode,
                                  depth = depth, table = table, sigma_mode = sigma_mode)
     if constraint_mode == :terminate && violated
         child.is_terminal = true       # amputate the branch past a violation
@@ -896,6 +1288,8 @@ function leaf_value(pomdp::SpacecraftCAPOMDP, node::BeliefNode;
                     constraint_mode::Symbol = MCTS_CONSTRAINT_MODE,
                     pc_weight::Real = MCTS_PC_REWARD_WEIGHT,
                     pc_penalty::Real = MCTS_PC_VIOLATION_PENALTY,
+                    reward_mode::Symbol = MCTS_REWARD_MODE,
+                    terminal_penalty::Real = MCTS_TERMINAL_PENALTY,
                     depth::Union{Int,Nothing} = nothing,
                     table::Union{SigmaTCATable,Nothing} = nothing,
                     sigma_mode::Symbol = MCTS_SIGMA_MODE)
@@ -906,8 +1300,20 @@ function leaf_value(pomdp::SpacecraftCAPOMDP, node::BeliefNode;
     violated = pc > pomdp.pc_threshold
     node.violated = violated
     v = -pc_weight * pc
-    if violated && constraint_mode != :off
-        v -= pc_penalty
+    if reward_mode == :terminal
+        # SOFT terminal constraint: a flat over-δ penalty ON TOP of −pc_weight·Pc.
+        # A barely-over branch is still ranked by its Pc (compared, not amputated),
+        # so the search prefers the least-infeasible option when none is feasible.
+        # (Independent of constraint_mode, which governed the legacy per-step path;
+        # :off still suppresses it for the no-constraint ablation arm.)
+        if violated && constraint_mode != :off
+            v -= terminal_penalty
+        end
+    else
+        # legacy :per_step — the leaf mirrors the per-step violation penalty.
+        if violated && constraint_mode != :off
+            v -= pc_penalty
+        end
     end
     return v
 end
@@ -937,12 +1343,21 @@ function simulate!(pomdp::SpacecraftCAPOMDP, node::BeliefNode, depth::Int,
                    constraint_mode::Symbol = MCTS_CONSTRAINT_MODE,
                    pc_weight::Real = MCTS_PC_REWARD_WEIGHT,
                    pc_penalty::Real = MCTS_PC_VIOLATION_PENALTY,
+                   reward_mode::Symbol = MCTS_REWARD_MODE,
+                   terminal_penalty::Real = MCTS_TERMINAL_PENALTY,
                    node_depth::Int = 0,
                    table::Union{SigmaTCATable,Nothing} = nothing,
-                   sigma_mode::Symbol = MCTS_SIGMA_MODE)
-    if node.is_terminal || depth <= 0
+                   sigma_mode::Symbol = MCTS_SIGMA_MODE,
+                   grid::Union{DecisionGrid,Nothing} = nothing)
+    # On the adaptive grid, a node is a LEAF once it reaches the final epoch (TCA),
+    # i.e. its tree depth has consumed the whole grid — regardless of the depth
+    # budget. This makes a rollout reach TCA in `grid_depth_count` steps so the
+    # terminal reward is actually seen (the point of Part 2).
+    grid_exhausted = grid !== nothing && node_depth >= grid_depth_count(grid)
+    if node.is_terminal || depth <= 0 || grid_exhausted
         return leaf_value(pomdp, node; constraint_mode = constraint_mode,
                           pc_weight = pc_weight, pc_penalty = pc_penalty,
+                          reward_mode = reward_mode, terminal_penalty = terminal_penalty,
                           depth = node_depth, table = table, sigma_mode = sigma_mode)
     end
 
@@ -963,7 +1378,9 @@ function simulate!(pomdp::SpacecraftCAPOMDP, node::BeliefNode, depth::Int,
                                 cadence_sc = cadence_sc, cadence_debris = cadence_debris,
                                 constraint_mode = constraint_mode,
                                 pc_weight = pc_weight, pc_penalty = pc_penalty,
-                                depth = child_depth, table = table, sigma_mode = sigma_mode)
+                                reward_mode = reward_mode,
+                                depth = child_depth, table = table, sigma_mode = sigma_mode,
+                                grid = grid)
         push!(kids, child)
     else
         child = rand(rng, kids)
@@ -972,6 +1389,7 @@ function simulate!(pomdp::SpacecraftCAPOMDP, node::BeliefNode, depth::Int,
         r, _, _ = step_reward(pomdp, a, child;
                               constraint_mode = constraint_mode,
                               pc_weight = pc_weight, pc_penalty = pc_penalty,
+                              reward_mode = reward_mode,
                               depth = child_depth, table = table, sigma_mode = sigma_mode)
     end
 
@@ -981,8 +1399,11 @@ function simulate!(pomdp::SpacecraftCAPOMDP, node::BeliefNode, depth::Int,
                                                c = c, k = k, α = α,
                                                constraint_mode = constraint_mode,
                                                pc_weight = pc_weight, pc_penalty = pc_penalty,
+                                               reward_mode = reward_mode,
+                                               terminal_penalty = terminal_penalty,
                                                node_depth = child_depth,
-                                               table = table, sigma_mode = sigma_mode)
+                                               table = table, sigma_mode = sigma_mode,
+                                               grid = grid)
 
     # running-average backup on the per-action value
     node.Na[a] = na + 1
@@ -1025,6 +1446,9 @@ struct MCTSPlanner
     sigma_mode::Symbol
     parallel::Bool
     n_workers::Union{Int,Nothing}
+    reward_mode::Symbol
+    terminal_penalty::Float64
+    grid::Union{DecisionGrid,Nothing}
 end
 
 function MCTSPlanner(pomdp::SpacecraftCAPOMDP;
@@ -1041,12 +1465,20 @@ function MCTSPlanner(pomdp::SpacecraftCAPOMDP;
                      pc_penalty::Real = MCTS_PC_VIOLATION_PENALTY,
                      sigma_mode::Symbol = MCTS_SIGMA_MODE,
                      parallel::Bool = MCTS_PARALLEL,
-                     n_workers::Union{Int,Nothing} = MCTS_N_WORKERS)
-    return MCTSPlanner(pomdp, n_iterations, max_depth, Float64(c),
+                     n_workers::Union{Int,Nothing} = MCTS_N_WORKERS,
+                     reward_mode::Symbol = MCTS_REWARD_MODE,
+                     terminal_penalty::Real = MCTS_TERMINAL_PENALTY,
+                     grid::Union{DecisionGrid,Nothing} = nothing)
+    # On the adaptive grid the max usable depth is the number of grid steps (a
+    # rollout reaches TCA there); cap max_depth to it so the depth budget never
+    # cuts a rollout short of the terminal epoch it was built to reach.
+    md = grid === nothing ? max_depth : min(max_depth, grid_depth_count(grid))
+    return MCTSPlanner(pomdp, n_iterations, md, Float64(c),
                        Float64(k), Float64(α), Float64(dt),
                        Float64(cadence_sc), Float64(cadence_debris),
                        constraint_mode, Float64(pc_weight), Float64(pc_penalty),
-                       sigma_mode, parallel, n_workers)
+                       sigma_mode, parallel, n_workers,
+                       reward_mode, Float64(terminal_penalty), grid)
 end
 
 """
@@ -1070,7 +1502,8 @@ function run_sims!(planner::MCTSPlanner, root::BeliefNode, rng::AbstractRNG;
         table = build_sigma_tca_table(planner.pomdp, root; dt = planner.dt,
                                       cadence_sc = planner.cadence_sc,
                                       cadence_debris = planner.cadence_debris,
-                                      max_depth = planner.max_depth)
+                                      max_depth = planner.max_depth,
+                                      grid = planner.grid)
     end
     for _ in 1:n_iterations
         simulate!(planner.pomdp, root, planner.max_depth, rng;
@@ -1079,7 +1512,10 @@ function run_sims!(planner::MCTSPlanner, root::BeliefNode, rng::AbstractRNG;
                   c = planner.c, k = planner.k, α = planner.α,
                   constraint_mode = planner.constraint_mode,
                   pc_weight = planner.pc_weight, pc_penalty = planner.pc_penalty,
-                  node_depth = 0, table = table, sigma_mode = planner.sigma_mode)
+                  reward_mode = planner.reward_mode,
+                  terminal_penalty = planner.terminal_penalty,
+                  node_depth = 0, table = table, sigma_mode = planner.sigma_mode,
+                  grid = planner.grid)
     end
     return root, table
 end
@@ -1279,7 +1715,8 @@ function plan_parallel(planner::MCTSPlanner, root::BeliefNode, rng::AbstractRNG)
             build_sigma_tca_table(planner.pomdp, root; dt = planner.dt,
                                   cadence_sc = planner.cadence_sc,
                                   cadence_debris = planner.cadence_debris,
-                                  max_depth = planner.max_depth) : nothing
+                                  max_depth = planner.max_depth,
+                                  grid = planner.grid) : nothing
 
     local stats::Vector{Any}
     if n_pool == 0

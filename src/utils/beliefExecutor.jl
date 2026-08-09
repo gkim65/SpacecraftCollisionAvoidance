@@ -87,10 +87,18 @@ function run_episode(planner::MCTSPlanner, pomdp::SpacecraftCAPOMDP, s0::CAState
                      rng::AbstractRNG;
                      correct_at_root::Bool = pomdp.correct_at_root,
                      max_steps::Int = planner.max_depth,
+                     grid_builder = nothing,
                      verbose::Bool = false)
-    @assert planner.dt == pomdp.dt "planner.dt ($(planner.dt)) must equal pomdp.dt "*
-        "($(pomdp.dt)): POMDPs.transition advances the true state by pomdp.dt, so the "*
-        "planner must simulate the same step size the executed world takes."
+    # dt-consistency: on the FIXED grid the true state advances by pomdp.dt, so the
+    # planner must simulate that same step (asserted). On the ADAPTIVE grid the step
+    # is the grid's first epoch gap and the truth is advanced by exactly that (via
+    # transition_dt), so the fixed-dt equality does not apply — skip the assert.
+    adaptive = planner.grid !== nothing || grid_builder !== nothing
+    if !adaptive
+        @assert planner.dt == pomdp.dt "planner.dt ($(planner.dt)) must equal pomdp.dt "*
+            "($(pomdp.dt)): POMDPs.transition advances the true state by pomdp.dt, so the "*
+            "planner must simulate the same step size the executed world takes."
+    end
 
     trace = ExecStep[]
 
@@ -107,24 +115,51 @@ function run_episode(planner::MCTSPlanner, pomdp::SpacecraftCAPOMDP, s0::CAState
         step += 1
         t_remaining = s_true.t
 
+        # ADAPTIVE GRID: rebuild the grid from the CURRENT time-to-TCA each step, so
+        # it adapts as the episode marches down the horizon (receding-horizon /
+        # per-step grid). `grid_builder(t)` returns a DecisionGrid for the remaining
+        # horizon; else reuse the planner's fixed grid. The step actually EXECUTED
+        # is the grid's FIRST epoch gap (its first decision), keeping the executed
+        # world on the same timeline the planner optimized over.
+        step_planner = planner
+        if grid_builder !== nothing
+            g = grid_builder(t_remaining)
+            step_planner = MCTSPlanner(pomdp;
+                n_iterations = planner.n_iterations, max_depth = planner.max_depth,
+                c = planner.c, k = planner.k, α = planner.α, dt = planner.dt,
+                cadence_sc = planner.cadence_sc, cadence_debris = planner.cadence_debris,
+                constraint_mode = planner.constraint_mode, pc_weight = planner.pc_weight,
+                pc_penalty = planner.pc_penalty, sigma_mode = planner.sigma_mode,
+                parallel = planner.parallel, n_workers = planner.n_workers,
+                reward_mode = planner.reward_mode, terminal_penalty = planner.terminal_penalty,
+                grid = g)
+        end
+        exec_grid = step_planner.grid
+
         # 1. PLAN from the current belief + true state. Build a fresh root node
         #    carrying the current belief, true state, and cadence-timer phase, then
         #    run one plan. (The planner re-derives its own timers from the node.)
         root = BeliefNode(belief, s_true, isterminal(pomdp, s_true);
                           since_sc = since_sc, since_debris = since_debris)
-        a, _ = plan(planner, root, rng)
+        a, _ = plan(step_planner, root, rng)
 
-        # 2. EXECUTE: advance the TRUE state one pomdp.dt step.
-        sp = rand(rng, POMDPs.transition(pomdp, s_true, a))
+        # 2. EXECUTE: advance the TRUE state. Fixed grid ⇒ pomdp.dt; adaptive grid
+        #    ⇒ the grid's first epoch gap (the step the plan actually decided).
+        exec_dt = exec_grid === nothing ? pomdp.dt : exec_grid.dts[1]
+        sp = rand(rng, transition_dt(pomdp, s_true, a, exec_dt))
 
         # 3. UPDATE the belief with the SHARED per-step update (predict → sample z
-        #    → cadence-aware correct) — identical to what the planner simulates.
+        #    → cadence-aware correct) — identical to what the planner simulates. On
+        #    the adaptive grid pass the grid + grid_depth=1 so the correction schedule
+        #    matches the planner's first step exactly.
         belief, since_sc, since_debris = step_belief(pomdp, belief, a, sp, rng;
-                                                     dt = pomdp.dt,
+                                                     dt = exec_dt,
                                                      cadence_sc = pomdp.cadence_sc,
                                                      cadence_debris = pomdp.cadence_debris,
                                                      since_sc = since_sc,
-                                                     since_debris = since_debris)
+                                                     since_debris = since_debris,
+                                                     grid = exec_grid,
+                                                     grid_depth = exec_grid === nothing ? nothing : 1)
 
         # 4. LOG the step. Pc-at-TCA is evaluated from the post-step belief via the
         #    planner's own node_pc (exact per-node — the trace is not the hot loop,
