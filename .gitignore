@@ -12,3 +12,6 @@ src/tests/cara_truth.csv
 .DS_Store
 # wandb local run directory (episode-sweep run artifacts + offline runs)
 wandb/
+
+# generated sweep/analysis exports (regenerable via scripts/export_sweep.py)
+figureScripts/data/*.csv
