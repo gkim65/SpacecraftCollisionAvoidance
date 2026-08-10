@@ -571,3 +571,48 @@ time), that `elrod_pc` on the untouched TCA endpoint (`b_tca`) matches CARA's
 operational Pc, and that the **back-propagated detection seed forward-grows back to
 CARA's Pc** (the covariance-fix round-trip — recovers Pc to <0.3 dex and the CDM TCA
 covariance to <5%).
+
+### Per-episode metrics + the cluster wandb sweep (debris tracking-fidelity study)
+
+`run_episode_metrics(cfg)` (`src/utils/beliefExecutor.jl`) runs ONE receding-horizon
+episode described by a flat config `Dict` and returns a flat, JSON-serializable
+metrics `Dict` — echoed config, scenario provenance, core metrics (resolved-without-
+maneuver, peak/integrated/at-TCA Pc, Δv, maneuver count + timings, `lead_time_at_first_
+maneuver_h`, `maneuver_mitigated`), the decision-vs-feasibility verdict, a
+well-formedness self-check, the full per-step trace, and the no-maneuver WAIT-spine
+feasibility curve. Decision epochs are the **secondary's measurement schedule** (its
+cadence) + TCA (`grid_mode=:measurement`, the default; `:adaptive` keeps the older
+crossing-refined grid as a diagnostic).
+
+The **F2 figure** — does a debris conjunction resolve by WAITing, and how does that
+depend on sensor quality × measurement cadence — is a wandb **sweep** over the 8-case
+debris cohort (lead ≤ 30 h) × `sensor_quality {best,median,worst}` × `cadence {2,4,8,24
+h}` × `seed {1..5}` = 480 episodes, `:exact`. One wandb run = one episode; N parallel
+`wandb agent`s fan the grid across nodes.
+
+Harness (`scripts/`):
+- `run_episode_entry.jl` — scheduler-agnostic "run ONE config" seam: reads a `CONFIG`
+  dict, runs `run_episode_metrics`, writes the metrics dict as JSON.
+- `wandb_runner.py` — the thin wandb client: `init` → shell out to the Julia entry →
+  log (sweep-comparable scalars to `wandb.summary`; the trace + WAIT-spine as
+  `wandb.Table`s so nothing is lost) → `finish`. **Fail-soft** — the metrics JSON is
+  the source of truth; a wandb failure never loses an episode.
+- `sweep.yaml` — the grid. `SWEEP_LAUNCH.md` — the cluster env + agent-launch guide.
+
+```bash
+uv sync                       # installs brahe + numpy + wandb
+
+# one episode, no wandb (just the metrics JSON):
+uv run python scripts/wandb_runner.py --no-wandb \
+  --case data/cara_cdms/000040115_conj_000030660_20230721_100115_20230720_061903.cdm \
+  --sensor-quality best --cadence-h 8 --seed 1 --out /tmp/metrics.json
+# 40115 vs 30660 (debris), :best → DEFER (no maneuver), Pc-at-TCA → ~1e-18.
+
+# one episode logged to wandb (offline is fine for a smoke test):
+WANDB_MODE=offline uv run python scripts/wandb_runner.py --case <cdm> \
+  --sensor-quality best --cadence-h 8 --seed 1
+
+# the full sweep on a cluster:
+wandb sweep scripts/sweep.yaml            # prints a SWEEP_ID
+uv run wandb agent <SWEEP_ID>             # run N of these in parallel (see SWEEP_LAUNCH.md)
+```

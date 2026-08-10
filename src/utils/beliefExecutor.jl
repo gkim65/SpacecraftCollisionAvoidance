@@ -222,7 +222,7 @@ end
                    reward_mode=:terminal, constraint_mode=:penalize, k=2.0,
                    truncate_safe=false, sec_class_override=nothing,
                    dt=60*60, t_horizon=nothing, pc_threshold=nothing,
-                   max_steps=nothing) -> Dict{String,Any}
+                   max_steps=nothing, grid_mode=:measurement) -> Dict{String,Any}
 
 Build a default episode CONFIG dict (the input a sweep varies). Every field maps
 to a knob `run_episode_metrics` consumes; a sweep script copies this, overrides
@@ -248,6 +248,7 @@ function episode_config(; case_path::AbstractString,
                         t_horizon::Union{Real,Nothing} = nothing,
                         pc_threshold::Union{Real,Nothing} = nothing,
                         max_steps::Union{Integer,Nothing} = nothing,
+                        grid_mode::Symbol = :measurement,
                         verbose::Bool = false)
     return Dict{String,Any}(
         "case_path"         => String(case_path),
@@ -268,6 +269,7 @@ function episode_config(; case_path::AbstractString,
         "t_horizon"         => t_horizon,
         "pc_threshold"      => pc_threshold,
         "max_steps"         => max_steps,
+        "grid_mode"         => String(grid_mode),
         "verbose"           => verbose,
     )
 end
@@ -284,9 +286,11 @@ and return a flat, JSON-serializable metrics dict ready for `wandb.log`. Steps:
 
  1. Load the CDM scenario (`load_cdm_scenario`) with the config's sensor quality /
     class override / horizon / pc_threshold.
- 2. Build a per-step ADAPTIVE grid builder (`adaptive_decision_grid` at the config
-    cadence) — rebuilt each executed step from the current time-to-TCA (receding
-    horizon), so the grid adapts as the episode marches down.
+ 2. Build a per-step decision-grid builder — rebuilt each executed step from the
+    current time-to-TCA (receding horizon). Default `grid_mode=:measurement`: decision
+    epochs = the SECONDARY's measurement schedule (its cadence) + TCA (`decision_grid`).
+    `grid_mode=:adaptive` keeps the crossing-refined grid (`adaptive_decision_grid`) as
+    a swappable diagnostic; measurement-schedule is the sweep default.
  3. Run `run_episode` at `:exact` (or the configured `sigma_mode`) with a seeded
     RNG.
  4. Roll the trace up into metrics AND compute the no-maneuver WAIT-spine
@@ -319,6 +323,7 @@ function run_episode_metrics(cfg::AbstractDict)
         k              = Float64(_cfg(cfg, "k", 2.0))
         coarse         = Float64(_cfg(cfg, "coarse", 8 * 3600))
         truncate_safe  = Bool(_cfg(cfg, "truncate_safe", false))
+        grid_mode      = _sym(_cfg(cfg, "grid_mode", :measurement))
 
         # 1. load the scenario. Only pass pc_threshold / t_horizon overrides when set.
         loader_kwargs = Dict{Symbol,Any}(:dt => dt, :sensor_quality => sensor_quality)
@@ -334,21 +339,35 @@ function run_episode_metrics(cfg::AbstractDict)
         fine_cfg = _cfg(cfg, "fine", nothing)
         fine = fine_cfg === nothing ? sec_cad : Float64(fine_cfg)
 
-        # 2. per-step adaptive grid builder (receding horizon). Rebuilt from the
+        # 2. per-step decision-grid builder (receding horizon). Rebuilt from the
         #    CURRENT time-to-TCA each executed step by run_episode.
-        grid_builder = t -> begin
-            g, _ = adaptive_decision_grid(pomdp, sc.b0, sc.s_true, t;
-                                          cadence_secondary = sec_cad,
-                                          coarse = coarse, fine = fine,
-                                          truncate_safe = truncate_safe)
-            g
+        #    :measurement (default) — decision epochs = the SECONDARY's measurement
+        #      schedule (its cadence) + TCA. Simple, principled (decide when info
+        #      arrives), no adaptive/crossing logic. `decision_grid`.
+        #    :adaptive — the crossing-refined grid (coarse everywhere, `fine` around
+        #      the WAIT-becomes-safe crossing). Kept swappable for diagnostics; NOT
+        #      the sweep default (untrusted adaptive logic, and the :fast path crashes
+        #      on it). `adaptive_decision_grid`.
+        if grid_mode === :adaptive
+            grid_builder = t -> begin
+                g, _ = adaptive_decision_grid(pomdp, sc.b0, sc.s_true, t;
+                                              cadence_secondary = sec_cad,
+                                              coarse = coarse, fine = fine,
+                                              truncate_safe = truncate_safe)
+                g
+            end
+            root_grid, _ = adaptive_decision_grid(pomdp, sc.b0, sc.s_true, sc.t_horizon;
+                                        cadence_secondary = sec_cad, coarse = coarse,
+                                        fine = fine, truncate_safe = truncate_safe)
+        else
+            grid_mode === :measurement ||
+                error("run_episode_metrics: grid_mode must be :measurement or :adaptive (got $grid_mode)")
+            grid_builder = t -> decision_grid(t; cadence_secondary = sec_cad)
+            root_grid = decision_grid(sc.t_horizon; cadence_secondary = sec_cad)
         end
 
         # depth cap = the root grid's step count (a rollout reaches TCA there); a
         # config `max_steps` can shorten it further.
-        root_grid, crossing_t = adaptive_decision_grid(pomdp, sc.b0, sc.s_true, sc.t_horizon;
-                                    cadence_secondary = sec_cad, coarse = coarse,
-                                    fine = fine, truncate_safe = truncate_safe)
         grid_steps = grid_depth_count(root_grid)
         ms_cfg = _cfg(cfg, "max_steps", nothing)
         max_steps = ms_cfg === nothing ? grid_steps : min(Int(ms_cfg), grid_steps)
@@ -370,10 +389,13 @@ function run_episode_metrics(cfg::AbstractDict)
 
         # 4. WAIT-spine feasibility curve from the root belief (no-maneuver ground
         #    truth — "could deferral resolve Pc, and when"). Uses the root grid's epochs.
+        #    This clean, no-drift spine is ALSO the mitigation ground-truth for the
+        #    per-maneuver `maneuver_mitigated` check (was the true geometry actually
+        #    resolved, vs. a drift-driven precautionary burn).
         spine_pc = wait_spine_pc(pomdp, sc.b0, sc.s_true, root_grid.t_epochs)
 
         metrics = _episode_metrics_dict(cfg, sc, pomdp, trace, root_grid, spine_pc,
-                                        crossing_t, sec_cad, grid_steps, max_steps,
+                                        sec_cad, grid_steps, max_steps,
                                         n_iterations, seed)
     end
     metrics["wall_time_s"] = round(t_wall, digits=3)
@@ -383,9 +405,10 @@ end
 # Roll one finished episode (trace + scenario + feasibility spine) into the flat
 # JSON-serializable metrics dict. Split out so it is independently testable.
 function _episode_metrics_dict(cfg, sc, pomdp, trace, root_grid, spine_pc,
-                               crossing_t, sec_cad, grid_steps, max_steps,
+                               sec_cad, grid_steps, max_steps,
                                n_iterations, seed)
     thr = pomdp.pc_threshold
+    epochs_h = [t / 3600 for t in root_grid.t_epochs]
 
     # --- per-step trace as a list of flat dicts (t descending; maneuver flag) ---
     trace_rows = [Dict{String,Any}(
@@ -423,7 +446,12 @@ function _episode_metrics_dict(cfg, sc, pomdp, trace, root_grid, spine_pc,
     # end-1; the very-last epoch is the forward-growth endpoint, see debris findings).
     durable_idx   = max(1, length(spine_pc) - 1)
     wait_durably_safe = spine_pc[durable_idx] <= thr
-    crossing_h = isnan(crossing_t) ? nothing : crossing_t / 3600
+    # crossing = first epoch (excluding the root) where the WAIT-spine Pc drops to/
+    # below threshold — the WAIT-becomes-safe time. Derived from the spine directly
+    # (the measurement-schedule grid has no separate crossing probe). `nothing` if it
+    # never crosses (a never-safe debris case). Matches the adaptive grid's definition.
+    xi = findfirst(i -> spine_pc[i] <= thr, 2:length(spine_pc))
+    crossing_h = xi === nothing ? nothing : epochs_h[xi + 1]
 
     # --- decision-vs-feasibility verdict (the "did it do the right thing" check) ---
     # If WAIT was durably feasible → the right call is to DEFER (no maneuver);
@@ -432,12 +460,45 @@ function _episode_metrics_dict(cfg, sc, pomdp, trace, root_grid, spine_pc,
     actual     = resolved_no_maneuver ? "defer" : "maneuver"
     decision_matches_feasibility = right_call == actual
 
+    # --- lead time at the first maneuver (did the planner genuinely WAIT?) ---
+    # The time-to-TCA (h) at the FIRST burn. Large ⇒ burned early / immediately;
+    # small ⇒ deferred and burned late (the "wait-and-measure" behavior). Same value
+    # as `first_maneuver_h` (t_remaining is time-to-TCA), surfaced under the explicit
+    # lead-time name the sweep tracks. `nothing` if the episode never maneuvered.
+    lead_time_at_first_maneuver_h = first_maneuver_h
+
+    # --- maneuver mitigation: did each burn actually drop Pc below threshold? ---
+    # Guards the "waited too long, burned, too late to matter" failure mode (esp.
+    # last-epoch burns — the maneuver study's latest-fixable-lead boundary). For each
+    # MANEUVER step we ask: is Pc-at-TCA at/after this burn below threshold along the
+    # EXECUTED path (trace `pc` IS Pc-at-TCA from the post-step belief, so it reflects
+    # the burn's effect). A burn is "mitigated" if Pc-at-TCA is below threshold by the
+    # END of the episode (at TCA) — a mid-episode burn that is later undone/insufficient
+    # is NOT counted mitigated. The overall flag: at least one maneuver AND the episode
+    # ends below threshold. When there are no maneuvers it is `nothing` (N/A — the
+    # deferral case is scored by wait feasibility, not mitigation).
+    maneuver_steps = [i for i in eachindex(trace) if trace[i].action == MANEUVER]
+    per_maneuver_mitigated = Bool[]
+    for i in maneuver_steps
+        # Pc-at-TCA reached by end-of-episode following this burn (the last trace Pc is
+        # the executed Pc-at-TCA at TCA; a burn "mitigates" if that final Pc is safe).
+        push!(per_maneuver_mitigated, isempty(trace) ? false : (trace[end].pc <= thr))
+    end
+    maneuver_mitigated = isempty(maneuver_steps) ? nothing :
+                         (!isempty(trace) && trace[end].pc <= thr && all(per_maneuver_mitigated))
+
     # --- finiteness / well-formedness self-check (a sweep can filter on it) ---
     pc_in_range = all(0.0 <= s.pc <= 1.0 for s in trace)
     all_finite  = all(isfinite(s.pc) && isfinite(s.miss) && isfinite(s.Δv) for s in trace) &&
                   all(isfinite(p) for p in spine_pc)
     # Δv only on MANEUVER steps (the trace-hygiene invariant).
     dv_only_on_maneuver = all((s.action == MANEUVER) == (s.Δv > 0) for s in trace)
+    # Maneuver actually mitigated: if the episode burned, did Pc-at-TCA end below
+    # threshold? A burn that leaves Pc-at-TCA above threshold is the too-late-burn
+    # failure mode — a real, reportable outcome, NOT a malformed trace, so it is
+    # surfaced as its OWN selfcheck field and does NOT gate `well_formed`. `true`
+    # when no maneuver (vacuously — nothing to mitigate).
+    maneuver_effective = maneuver_mitigated === nothing ? true : maneuver_mitigated
     well_formed = pc_in_range && all_finite && dv_only_on_maneuver
 
     return Dict{String,Any}(
@@ -481,6 +542,9 @@ function _episode_metrics_dict(cfg, sc, pomdp, trace, root_grid, spine_pc,
         "n_maneuvers"    => n_maneuvers,
         "maneuver_timings_h" => maneuver_timings_h,
         "first_maneuver_h"   => first_maneuver_h,
+        "lead_time_at_first_maneuver_h" => lead_time_at_first_maneuver_h,
+        "maneuver_mitigated"        => maneuver_mitigated,
+        "per_maneuver_mitigated"    => per_maneuver_mitigated,
         "final_miss_m"   => final_miss,
         "n_steps"        => n_steps,
         # ---- decision-vs-feasibility ----
@@ -495,6 +559,7 @@ function _episode_metrics_dict(cfg, sc, pomdp, trace, root_grid, spine_pc,
         "pc_in_range"            => pc_in_range,
         "all_finite"             => all_finite,
         "dv_only_on_maneuver"    => dv_only_on_maneuver,
+        "maneuver_effective"     => maneuver_effective,
         # ---- full trace + feasibility curve (nested, for plotting later) ----
         "trace"          => trace_rows,
         "wait_spine_pc"  => collect(Float64.(spine_pc)),

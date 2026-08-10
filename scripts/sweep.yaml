@@ -1,0 +1,70 @@
+# =============================================================================
+# sweep.yaml — the debris-cohort tracking-fidelity sweep (paper figure F2).
+#
+# ONE run = ONE receding-horizon episode. wandb's `grid` method takes the CARTESIAN
+# PRODUCT of the axes below and hands each cell to scripts/wandb_runner.py through
+# wandb.config; the runner shells out to the Julia entry (run_episode_metrics) and
+# logs the metrics dict. N parallel `wandb agent`s each pull the next unclaimed cell
+# → the fan-out IS the parallelism (see scripts/SWEEP_LAUNCH.md).
+#
+# GRID (Grace, 2026-08-09):
+#   case            : the 8 DEBRIS-secondary CARA CDMs, lead <= 30 h (the operational
+#                     decision window; the well-behaved cohort from the deep-dive).
+#   sensor_quality  : best | median | worst  (SSN radar grade -> tracking noise).
+#   cadence_h       : 2 | 4 | 8 | 24 h        (secondary measurement freshness).
+#   seed            : 1..5                     (measurement-noise draw; median/worst
+#                     are stochastic -> a decision distribution. TO ADD MORE SEEDS
+#                     LATER: append e.g. 6,7,8 here and re-run `wandb agent <id>` —
+#                     the sweep just picks up the new unclaimed cells, nothing else
+#                     changes. best is ~deterministic; extra seeds there just repeat.)
+#
+#   = 8 cases x 3 quality x 4 cadence x 5 seeds = 480 episodes.
+#
+# FIXED for the whole sweep (NOT swept): :exact sigma, terminal reward, penalize
+# constraint, measurement-schedule grid, n_iterations=12 (Grace: keep the per-episode
+# MCTS budget modest; spend the budget on SEEDS, not in-plan rollouts).
+# =============================================================================
+
+program: scripts/wandb_runner.py
+method: grid
+project: spacecraftCA-belief-mcts
+entity: kmeans_gsopt          # the RSSDA-benchmark wandb team; override with WANDB_ENTITY.
+
+# wandb agent runs: `python scripts/wandb_runner.py <args>`. The runner reads the
+# swept axes from wandb.config (no CLI needed under a sweep), so `command` only needs
+# the interpreter + program. `uv run` is used so the in-repo venv (wandb + brahe) is active.
+command:
+  - uv
+  - run
+  - python
+  - ${program}
+
+parameters:
+  case_path:
+    values:
+      - data/cara_cdms/000040059_conj_000035921_20220326_194122_20220325_215435.cdm
+      - data/cara_cdms/000040115_conj_000030660_20230721_100115_20230720_061903.cdm
+      - data/cara_cdms/000025994_conj_000026132_20220224_100307_20220221_225515.cdm
+      - data/cara_cdms/000038771_conj_000030802_20201216_182131_20201215_171306.cdm
+      - data/cara_cdms/000029108_conj_000034995_20220706_165058_20220705_143113.cdm
+      - data/cara_cdms/000037849_conj_000013512_20210612_084905_20210611_062043.cdm
+      - data/cara_cdms/000033591_conj_000042216_20211203_183431_20211202_153618.cdm
+      - data/cara_cdms/000028654_conj_000041835_20220106_193032_20220105_161142.cdm
+  sensor_quality:
+    values: [best, median, worst]
+  cadence_h:                  # HOURS; the runner converts to seconds (cadence_secondary).
+    values: [2, 4, 8, 24]
+  seed:
+    values: [1, 2, 3, 4, 5]
+
+  # ---- fixed knobs (single-value => constant across the sweep) ----
+  sigma_mode:
+    value: exact
+  reward_mode:
+    value: terminal
+  constraint_mode:
+    value: penalize
+  grid_mode:
+    value: measurement
+  n_iterations:
+    value: 12

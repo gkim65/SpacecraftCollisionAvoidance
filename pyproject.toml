@@ -6,9 +6,10 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "brahe==1.7.0",
     "numpy>=2.0,<3.0",
+    "wandb>=0.16",
 ]
 
 [tool.uv]
-# brahe and numpy are the only packages the Julia code imports via PyCall
-# (pyimport("brahe"), pyimport("numpy")). Keep this environment minimal so
-# PyCall has a small, reproducible target.
+# brahe and numpy are what the Julia code imports via PyCall (pyimport("brahe"),
+# pyimport("numpy")); wandb is used by scripts/wandb_runner.py (the cluster episode
+# sweep client) — it is NOT imported through PyCall, only by the Python runner.
