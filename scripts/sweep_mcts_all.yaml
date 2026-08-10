@@ -21,6 +21,8 @@ command:
   - run
   - python
   - ${program}
+  - --timeout-s          # per-episode Julia timeout: 4 h (2h-cadence MCTS cells under
+  - "14400"              # 28-way contention exceed the 3600 s default — bump it up.
 
 parameters:
   cadence_h:
