@@ -40,6 +40,14 @@ command:
   - ${program}
 
 parameters:
+  # NOTE on ORDER: wandb's `grid` enumerates in the order the parameters are listed
+  # and varies the LAST-listed axis fastest. `cadence_h` is listed FIRST and ordered
+  # LONGEST-cadence-first (24 -> 2) so the CHEAP cells (24 h = fewest decision steps ~=
+  # fastest episode) are enumerated and finish BEFORE the expensive 2 h cells (~12
+  # decision steps, minutes each). This front-loads quick green runs; the slow 2 h
+  # cells trickle in at the tail.
+  cadence_h:                  # HOURS; the runner converts to seconds (cadence_secondary).
+    values: [24, 8, 4, 2]
   case_path:
     values:
       - data/cara_cdms/000040059_conj_000035921_20220326_194122_20220325_215435.cdm
@@ -52,8 +60,6 @@ parameters:
       - data/cara_cdms/000028654_conj_000041835_20220106_193032_20220105_161142.cdm
   sensor_quality:
     values: [best, median, worst]
-  cadence_h:                  # HOURS; the runner converts to seconds (cadence_secondary).
-    values: [2, 4, 8, 24]
   seed:
     values: [1, 2, 3, 4, 5]
 
