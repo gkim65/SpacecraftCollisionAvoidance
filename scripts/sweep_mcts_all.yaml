@@ -1,0 +1,55 @@
+# =============================================================================
+# sweep_mcts_all.yaml — MCTS across ALL cadences, in a FRESH project (clean run).
+#
+# One sweep = the mcts policy over cadence {24,8,4,2} × 8 cases × 3 quality × 5
+# seeds = 480 episodes. Logs to a NEW project (spacecraftCA-mcts-clean) so it does
+# not mix with earlier (pre-seed-fix) runs. Run with a MODEST agent count (~28) so
+# the heavy 2 h cells never oversubscribe memory/cores (they are the slow tail).
+#
+# This is the "simplest" clean-slate variant (Grace 2026-08-10): just the method
+# (MCTS), all cadences, one sweep ID, one project. Baselines/gates are a separate
+# run when wanted (sweep_gates.yaml).
+# =============================================================================
+
+program: scripts/wandb_runner.py
+method: grid
+project: spacecraftCA-mcts-clean       # FRESH project — no mixing with old runs
+entity: kmeans_gsopt
+
+command:
+  - uv
+  - run
+  - python
+  - ${program}
+
+parameters:
+  cadence_h:
+    values: [24, 8, 4, 2]              # longest-first so cheap cells finish first
+  case_path:
+    values:
+      - data/cara_cdms/000040059_conj_000035921_20220326_194122_20220325_215435.cdm
+      - data/cara_cdms/000040115_conj_000030660_20230721_100115_20230720_061903.cdm
+      - data/cara_cdms/000025994_conj_000026132_20220224_100307_20220221_225515.cdm
+      - data/cara_cdms/000038771_conj_000030802_20201216_182131_20201215_171306.cdm
+      - data/cara_cdms/000029108_conj_000034995_20220706_165058_20220705_143113.cdm
+      - data/cara_cdms/000037849_conj_000013512_20210612_084905_20210611_062043.cdm
+      - data/cara_cdms/000033591_conj_000042216_20211203_183431_20211202_153618.cdm
+      - data/cara_cdms/000028654_conj_000041835_20220106_193032_20220105_161142.cdm
+  sensor_quality:
+    values: [best, median, worst]
+  seed:
+    values: [1, 2, 3, 4, 5]
+  policy_variant:
+    values: [mcts]
+
+  # ---- fixed knobs ----
+  sigma_mode:
+    value: exact
+  reward_mode:
+    value: terminal
+  constraint_mode:
+    value: penalize
+  grid_mode:
+    value: measurement
+  n_iterations:
+    value: 12
