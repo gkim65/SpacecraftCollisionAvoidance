@@ -616,3 +616,30 @@ WANDB_MODE=offline uv run python scripts/wandb_runner.py --case <cdm> \
 wandb sweep scripts/sweep.yaml            # prints a SWEEP_ID
 uv run wandb agent <SWEEP_ID>             # run N of these in parallel (see SWEEP_LAUNCH.md)
 ```
+
+#### Exporting the sweep + the post-sweep analyses (A1–A4)
+
+Once the cluster sweep has run, pull it to a local table and run the post-sweep
+analyses offline. The all-policies sweep lives in two wandb projects —
+`spacecraftCA-mcts-clean` (the MCTS planner) and `spacecraftCA-belief-mcts` (the F3
+baselines: the `wait_feasibility` oracle + `delay_{28,12,6,3}h` gates).
+
+- `scripts/export_sweep.py` — pulls BOTH projects, keeps ONLY runs with wandb
+  `state == "finished"` (crashed/failed runs are excluded and tallied, so a crashed
+  run can never leak into a violation count), tags each row `source_project` +
+  `policy_variant`, and writes a light per-run scalar table
+  `figureScripts/data/sweep_all.{csv,json}` plus `sweep_coverage.json` (per
+  policy×quality×cadence cell: finished vs expected, with the holes flagged). The
+  heavy per-step trace / Σ / WAIT-spine are wandb Table artifacts; `--traces-only-mcts`
+  downloads them inline to `figureScripts/data/traces/` (needed only for figures).
+- `scripts/analyze_sweep.py` — the A1–A4 analyses on that table →
+  `figureScripts/data/analysis_A_results.json` + a console report. A1 (TCA-violation
+  check, split avoidable vs least-infeasible-fallback), A3 (does the chance constraint
+  keep the chosen branch feasible), A2 (per-cell seed agreement), A4 (MCTS-vs-baseline
+  tracking-fidelity boundary). δ (`pc_threshold`=1e-5) and Δv (0.1 m/s) are fixed for
+  the whole sweep and injected as constants (wandb did not log them as scalars).
+
+```bash
+uv run python scripts/export_sweep.py      # -> figureScripts/data/sweep_all.{csv,json}
+uv run python scripts/analyze_sweep.py     # -> figureScripts/data/analysis_A_results.json
+```
