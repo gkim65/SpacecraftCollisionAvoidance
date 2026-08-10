@@ -1,0 +1,84 @@
+# =============================================================================
+# sweep_parrival.yaml — F5 PROBABILISTIC MEASUREMENT ARRIVAL, policy comparison.
+#
+# The one experiment where the belief-planner's advantage CANNOT be explained away
+# as "the baseline had worse information": every policy runs on the SAME true state,
+# the SAME sensor quality/cadence, and the SAME random debris-arrival draws. A
+# SCHEDULED debris (SSN/TLE) fix arrives with probability p_arrival; on a non-arrival
+# that step is predict-only (Σ grows, no innovation). The satellite GPS fix is NOT
+# gated (own-asset continuous track). Cadence is deterministic and a fixed clock can
+# be tuned to it; RANDOM non-arrival is the thing a fixed clock structurally cannot
+# tune to — so this is the axis that separates reasoning-about-arrival (MCTS) from
+# committing-blind (the delay gates).
+#
+# WHAT EACH POLICY DOES UNDER p<1 (interpretation, from baselines.jl):
+#   • mcts            — belief update sees non-arrival (Σ stays fat) AND rollouts
+#                       model the SAME p_arrival ⇒ genuinely anticipates arrival risk.
+#   • delay_<N>h      — reads Pc off the SAME drifted, arrival-affected belief MCTS
+#                       sees (fair, same-information), but its DECISION is a blind
+#                       fixed clock: it only REACTS to non-arrival at its trigger time,
+#                       never anticipates it. ⇒ the FAIR head-to-head vs mcts.
+#   • wait_feasibility — the idealized oracle plans ONCE with zero-innovation (assumes
+#                       ALL data arrives), then follows that fixed plan. Structurally
+#                       BLIND to p<1 (arrival-blind by design). NOT a fair opponent —
+#                       a value-of-information UPPER REFERENCE ("what you'd do if you
+#                       could count on all your data"); its degradation curve is a
+#                       supporting panel, not the load-bearing result. See the session
+#                       note 2026-08-10_prob-arrival.md for the framing.
+#
+# GRID: cadence {4} × 8 cases × quality {best,median,worst} × seed {1-5} ×
+#   policy {mcts, delay_28h/12h/6h/3h, wait_feasibility} × p_arrival {1.0,0.9,0.75,0.5}
+#   = 1 × 8 × 3 × 5 × 6 × 4 = 2880 episodes. p_arrival=1.0 is the regression anchor
+#   (byte-identical to the guaranteed-measurement runs). ONE combined file is safe
+#   because 2h is DROPPED — 4h has no OOM tail (2h was the memory-heavy cell the
+#   cost-split existed to isolate). Only the 480 mcts cells are heavy; the 2400 gate
+#   cells are ~seconds each. Run a MODEST agent count so the mcts cells never
+#   oversubscribe (~28). FRESH project so it does not mix with earlier sweeps.
+# =============================================================================
+
+program: scripts/wandb_runner.py
+method: grid
+project: spacecraftCA-parrival        # FRESH project for the F5 policy comparison
+entity: kmeans_gsopt
+
+command:
+  - uv
+  - run
+  - python
+  - ${program}
+  - --timeout-s          # per-episode Julia timeout: 4 h (mcts cells under ~28-way
+  - "14400"              # contention can exceed the 3600 s default at 4h cadence).
+
+parameters:
+  cadence_h:
+    values: [4]                        # 4h ONLY — drops the 2h OOM tail (safe to combine)
+  case_path:
+    values:
+      - data/cara_cdms/000040059_conj_000035921_20220326_194122_20220325_215435.cdm
+      - data/cara_cdms/000040115_conj_000030660_20230721_100115_20230720_061903.cdm
+      - data/cara_cdms/000025994_conj_000026132_20220224_100307_20220221_225515.cdm
+      - data/cara_cdms/000038771_conj_000030802_20201216_182131_20201215_171306.cdm
+      - data/cara_cdms/000029108_conj_000034995_20220706_165058_20220705_143113.cdm
+      - data/cara_cdms/000037849_conj_000013512_20210612_084905_20210611_062043.cdm
+      - data/cara_cdms/000033591_conj_000042216_20211203_183431_20211202_153618.cdm
+      - data/cara_cdms/000028654_conj_000041835_20220106_193032_20220105_161142.cdm
+  sensor_quality:
+    values: [best, median, worst]
+  seed:
+    values: [1, 2, 3, 4, 5]
+  policy_variant:                      # ALL policies in ONE sweep (mcts + gates + oracle)
+    values: [mcts, delay_28h, delay_12h, delay_6h, delay_3h, wait_feasibility]
+  p_arrival:                           # THE new axis (F5). 1.0 = regression anchor.
+    values: [1.0, 0.9, 0.75, 0.5]
+
+  # ---- fixed knobs ----
+  sigma_mode:
+    value: exact                       # :fast is INVALID under p<1 (guarded in code)
+  reward_mode:
+    value: terminal
+  constraint_mode:
+    value: penalize
+  grid_mode:
+    value: measurement
+  n_iterations:
+    value: 12

@@ -779,4 +779,62 @@ end
         @test_throws AssertionError run_episode(bad, pomdp, s0, MersenneTwister(7))
     end
 
+    @testset "15. Probabilistic measurement arrival (p_arrival)" begin
+        # A SCHEDULED debris (SSN/TLE) fix arrives with prob p_arrival; on a
+        # non-arrival the debris is predict-only that step (Σ grows, no innovation)
+        # and the cadence timer STILL resets. The satellite GPS fix is NOT gated.
+        # p_arrival = 1.0 must be byte-identical to the pre-arrival path (the
+        # Bernoulli draw is skipped, so the RNG stream — and every synthetic-suite
+        # result — is unchanged). :fast is invalid under p<1 (the branch-invariant
+        # debris Σ table no longer holds once arrival is a per-branch random draw).
+        pomdp = SpacecraftCAPOMDP(seed = 42, randAdd = false, dt = 60 * 60,
+                                  TCA_max = 10 * 60 * 60,
+                                  cadence_sc = 2 * 60 * 60, cadence_debris = 8 * 60 * 60,
+                                  correct_at_root = true)
+        s0 = make_conjunction_state(pomdp; miss_m = 500.0, v_rel = 15.0,
+                                    geometry = :cross_track, t = 10 * 60 * 60)
+        root = root_from_pomdp(pomdp, s0)
+
+        # Walk to the node just before the debris fix is due (step 8, 8 h elapsed).
+        node = root
+        for step in 1:7
+            node, _ = expand_child(pomdp, node, WAIT, MersenneTwister(step); dt = pomdp.dt)
+        end
+        @test node.since_debris == 7 * 60.0 * 60      # due next step
+
+        # (a) p_arrival = 1.0 is BYTE-IDENTICAL to the default (no kwarg): same RNG
+        #     seed → same belief AND same reward. Proves the p=1.0 guard skips the
+        #     Bernoulli draw (no RNG stream shift). Checked on the debris-due step.
+        cdef, rdef = expand_child(pomdp, node, WAIT, MersenneTwister(8); dt = pomdp.dt)
+        cp1,  rp1  = expand_child(pomdp, node, WAIT, MersenneTwister(8); dt = pomdp.dt,
+                                  p_arrival = 1.0)
+        @test cp1.belief.debris.Σ == cdef.belief.debris.Σ     # bitwise-identical debris Σ
+        @test cp1.belief.sc.Σ     == cdef.belief.sc.Σ         # bitwise-identical sat Σ
+        @test cp1.belief.debris.μ == cdef.belief.debris.μ
+        @test rp1 == rdef                                     # identical step reward
+        @test cdef.since_debris == 0.0                        # debris fix taken at p=1
+
+        # (b) p_arrival = 0.0: the scheduled debris fix NEVER arrives → the debris is
+        #     predict-only (its Σ equals the no-fix counterpart), yet the timer STILL
+        #     resets (the fetch was scheduled, just returned nothing).
+        cp0, _ = expand_child(pomdp, node, WAIT, MersenneTwister(8); dt = pomdp.dt,
+                              p_arrival = 0.0)
+        pomdp_nodfix = SpacecraftCAPOMDP(seed = 42, randAdd = false, dt = 60 * 60,
+                                         TCA_max = 10 * 60 * 60,
+                                         cadence_sc = 2 * 60 * 60,
+                                         cadence_debris = 100 * 60 * 60,  # debris never due
+                                         correct_at_root = true)
+        predonly, _ = expand_child(pomdp_nodfix, node, WAIT, MersenneTwister(8); dt = pomdp.dt)
+        @test cp0.belief.debris.Σ == predonly.belief.debris.Σ  # no innovation ⇒ = predict-only
+        @test cp0.since_debris == 0.0                          # timer reset (scheduled fix)
+        @test cdef.belief.debris.Σ[1, 1] < cp0.belief.debris.Σ[1, 1]  # arrived fix shrank Σ
+
+        # (f) :fast is INVALID under probabilistic arrival (stochastic per-branch
+        #     debris Σ breaks the branch-invariant Σ table) — the guard must error.
+        pln_fast = MCTSPlanner(pomdp; n_iterations = 10, max_depth = 8,
+                               dt = pomdp.dt, sigma_mode = :fast, p_arrival = 0.5)
+        rfast = root_from_pomdp(pomdp, s0)
+        @test_throws ErrorException plan(pln_fast, rfast, MersenneTwister(1))
+    end
+
 end

@@ -1121,7 +1121,7 @@ end
 
 """
     step_belief(pomdp, b, a, s_true_next, rng; dt=pomdp.dt, cadence_sc=..., cadence_debris=...,
-                since_sc, since_debris) -> (b′::Belief, since_sc′, since_debris′)
+                since_sc, since_debris, p_arrival=1.0) -> (b′::Belief, since_sc′, since_debris′)
 
 Advance belief `b` one `dt` step under action `a` (architecture §4 steps 2–4),
 applying the asymmetric measurement cadence. `predict` first (Σ grows one step;
@@ -1132,6 +1132,20 @@ cadence, at which point the timer resets to 0; otherwise the timer carries the
 step forward and that object is predict-only. Returns the updated belief and the
 advanced timers. Shared by `expand_child` (in-tree simulation) and the
 closed-loop executor (real-world update) so the two stay bit-for-bit consistent.
+
+PROBABILISTIC MEASUREMENT ARRIVAL (`p_arrival`): a SCHEDULED debris (SSN/TLE) fix
+ARRIVES with probability `p_arrival` (a Bernoulli draw from `rng`); on a
+non-arrival it is treated as if no measurement came — the debris is predict-only
+that step (Σ grew, no innovation) and the cadence timer STILL RESETS (the fetch
+was scheduled, it just returned nothing — the next one is a full cadence away).
+The satellite GPS fix is an own-asset continuous track and is NOT gated (always
+arrives when due). `p_arrival` is applied IDENTICALLY on both the grid and the
+cadence-timer path, and — because `step_belief` is the single shared update — the
+MCTS rollout (`expand_child`) and the real executor use the SAME arrival model,
+so the planner genuinely reasons about arrival rather than assuming p=1. When
+`p_arrival == 1.0` the Bernoulli draw is SKIPPED ENTIRELY (no `rand` consumed), so
+the RNG stream — and therefore every synthetic-suite result — is byte-identical to
+the pre-arrival code.
 """
 function step_belief(pomdp::SpacecraftCAPOMDP, b::Belief, a::CAAction,
                      s_true_next::CAState, rng::AbstractRNG;
@@ -1139,6 +1153,7 @@ function step_belief(pomdp::SpacecraftCAPOMDP, b::Belief, a::CAAction,
                      cadence_sc::Real = pomdp.cadence_sc,
                      cadence_debris::Real = pomdp.cadence_debris,
                      since_sc::Real, since_debris::Real,
+                     p_arrival::Real = 1.0,
                      grid::Union{DecisionGrid,Nothing} = nothing,
                      grid_depth::Union{Int,Nothing} = nothing)
     # ADAPTIVE GRID PATH: the step size and which object(s) are corrected come from
@@ -1152,7 +1167,10 @@ function step_belief(pomdp::SpacecraftCAPOMDP, b::Belief, a::CAAction,
         gdt = grid.dts[grid_depth]
         b = predict(pomdp, b, a; dt = gdt)
         do_sc = grid.correct_sc[grid_depth]
-        do_db = grid.correct_debris[grid_depth]
+        # probabilistic arrival gates the DEBRIS fix only (SSN/TLE fetch may not
+        # land); the satellite GPS fix always arrives. On a non-arrival the debris
+        # is predict-only this step (Σ already grew above, no innovation applied).
+        do_db = grid.correct_debris[grid_depth] && _debris_arrives(rng, p_arrival)
         if do_sc || do_db
             z = sample_observation(pomdp, a, s_true_next, rng)
             do_sc && (b = correct_linear_sc(pomdp, b, z))
@@ -1169,22 +1187,35 @@ function step_belief(pomdp::SpacecraftCAPOMDP, b::Belief, a::CAAction,
     # timer resets on a fix, else carries forward.
     since_sc     = Float64(since_sc)     + Float64(dt)
     since_debris = Float64(since_debris) + Float64(dt)
-    correct_sc     = since_sc     >= cadence_sc
-    correct_debris = since_debris >= cadence_debris
+    correct_sc      = since_sc     >= cadence_sc
+    debris_due      = since_debris >= cadence_debris
+    # probabilistic arrival: a scheduled debris fix arrives with prob p_arrival.
+    # On a non-arrival the debris is predict-only this step, but the timer STILL
+    # resets — the fetch was scheduled and simply returned nothing, so the next
+    # scheduled fix is a full cadence away (a missed fetch is not retried early).
+    # The satellite GPS fix (own-asset continuous track) is never gated.
+    debris_arrives  = debris_due && _debris_arrives(rng, p_arrival)
 
-    if correct_sc || correct_debris
+    if correct_sc || debris_arrives
         z = sample_observation(pomdp, a, s_true_next, rng)  # one genuine draw
         if correct_sc
             b = correct_linear_sc(pomdp, b, z)
-            since_sc = 0.0
         end
-        if correct_debris
+        if debris_arrives
             b = correct_linear_debris(pomdp, b, z)
-            since_debris = 0.0
         end
     end
+    correct_sc && (since_sc = 0.0)
+    debris_due && (since_debris = 0.0)   # timer resets on a scheduled fix, arrived or not
     return b, since_sc, since_debris
 end
+
+# Bernoulli arrival gate for a scheduled DEBRIS measurement. Returns true when the
+# fix arrives. `p_arrival == 1.0` short-circuits WITHOUT drawing from `rng`, so the
+# guaranteed-measurement path consumes no random number and stays byte-identical to
+# the pre-arrival stream (the p=1.0 regression anchor). Only drawn for p<1.
+_debris_arrives(rng::AbstractRNG, p_arrival::Real) =
+    p_arrival >= 1.0 || rand(rng) < p_arrival
 
 # =========================================================================
 # Expansion: one action's predict→sample z→correct + true-state transition.
@@ -1224,6 +1255,7 @@ function expand_child(pomdp::SpacecraftCAPOMDP, node::BeliefNode, a::CAAction,
                       pc_weight::Real = MCTS_PC_REWARD_WEIGHT,
                       pc_penalty::Real = MCTS_PC_VIOLATION_PENALTY,
                       reward_mode::Symbol = MCTS_REWARD_MODE,
+                      p_arrival::Real = 1.0,
                       depth::Union{Int,Nothing} = nothing,
                       table::Union{SigmaTCATable,Nothing} = nothing,
                       sigma_mode::Symbol = MCTS_SIGMA_MODE,
@@ -1245,6 +1277,7 @@ function expand_child(pomdp::SpacecraftCAPOMDP, node::BeliefNode, a::CAAction,
                                             cadence_debris = cadence_debris,
                                             since_sc = node.since_sc,
                                             since_debris = node.since_debris,
+                                            p_arrival = p_arrival,
                                             grid = grid, grid_depth = depth)
 
     child = BeliefNode(b, sp, isterminal(pomdp, sp);
@@ -1345,6 +1378,7 @@ function simulate!(pomdp::SpacecraftCAPOMDP, node::BeliefNode, depth::Int,
                    pc_penalty::Real = MCTS_PC_VIOLATION_PENALTY,
                    reward_mode::Symbol = MCTS_REWARD_MODE,
                    terminal_penalty::Real = MCTS_TERMINAL_PENALTY,
+                   p_arrival::Real = 1.0,
                    node_depth::Int = 0,
                    table::Union{SigmaTCATable,Nothing} = nothing,
                    sigma_mode::Symbol = MCTS_SIGMA_MODE,
@@ -1378,7 +1412,7 @@ function simulate!(pomdp::SpacecraftCAPOMDP, node::BeliefNode, depth::Int,
                                 cadence_sc = cadence_sc, cadence_debris = cadence_debris,
                                 constraint_mode = constraint_mode,
                                 pc_weight = pc_weight, pc_penalty = pc_penalty,
-                                reward_mode = reward_mode,
+                                reward_mode = reward_mode, p_arrival = p_arrival,
                                 depth = child_depth, table = table, sigma_mode = sigma_mode,
                                 grid = grid)
         push!(kids, child)
@@ -1401,6 +1435,7 @@ function simulate!(pomdp::SpacecraftCAPOMDP, node::BeliefNode, depth::Int,
                                                pc_weight = pc_weight, pc_penalty = pc_penalty,
                                                reward_mode = reward_mode,
                                                terminal_penalty = terminal_penalty,
+                                               p_arrival = p_arrival,
                                                node_depth = child_depth,
                                                table = table, sigma_mode = sigma_mode,
                                                grid = grid)
@@ -1448,6 +1483,10 @@ struct MCTSPlanner
     n_workers::Union{Int,Nothing}
     reward_mode::Symbol
     terminal_penalty::Float64
+    # probability a SCHEDULED debris (SSN/TLE) measurement actually arrives; on a
+    # non-arrival the debris is predict-only that step. 1.0 = the original
+    # guaranteed-measurement behavior (Bernoulli draw skipped, byte-identical).
+    p_arrival::Float64
     grid::Union{DecisionGrid,Nothing}
 end
 
@@ -1468,6 +1507,7 @@ function MCTSPlanner(pomdp::SpacecraftCAPOMDP;
                      n_workers::Union{Int,Nothing} = MCTS_N_WORKERS,
                      reward_mode::Symbol = MCTS_REWARD_MODE,
                      terminal_penalty::Real = MCTS_TERMINAL_PENALTY,
+                     p_arrival::Real = 1.0,
                      grid::Union{DecisionGrid,Nothing} = nothing)
     # On the adaptive grid the max usable depth is the number of grid steps (a
     # rollout reaches TCA there); cap max_depth to it so the depth budget never
@@ -1478,7 +1518,8 @@ function MCTSPlanner(pomdp::SpacecraftCAPOMDP;
                        Float64(cadence_sc), Float64(cadence_debris),
                        constraint_mode, Float64(pc_weight), Float64(pc_penalty),
                        sigma_mode, parallel, n_workers,
-                       reward_mode, Float64(terminal_penalty), grid)
+                       reward_mode, Float64(terminal_penalty),
+                       Float64(p_arrival), grid)
 end
 
 """
@@ -1495,6 +1536,16 @@ given the same `rng` state and iteration count. Returns the mutated `root` and t
 function run_sims!(planner::MCTSPlanner, root::BeliefNode, rng::AbstractRNG;
                    n_iterations::Int = planner.n_iterations,
                    table::Union{SigmaTCATable,Nothing} = nothing)
+    # :fast precomputes ONE branch-invariant debris Σ-at-depth table (the whole
+    # trick is that the debris Σ schedule is deterministic in depth). Probabilistic
+    # arrival (p_arrival < 1) makes each scheduled debris fix a random draw, so the
+    # debris Σ becomes genuinely branch-dependent — the table is no longer valid
+    # (same failure mode as Phase-8 maneuver noise). Use :exact under p_arrival < 1.
+    if planner.sigma_mode == :fast && planner.p_arrival < 1.0
+        error("build_sigma_tca_table (:fast) assumes a branch-invariant debris Σ, " *
+              "but p_arrival=$(planner.p_arrival) < 1.0 makes debris arrival stochastic " *
+              "per node. Use sigma_mode = :exact with probabilistic measurement arrival.")
+    end
     # Efficiency pass: under :fast, precompute the branch-invariant debris
     # Σ-at-TCA per depth ONCE (see the FAST Σ PATH section header), then look it
     # up per node instead of re-propagating the debris covariance every node.
@@ -1514,6 +1565,7 @@ function run_sims!(planner::MCTSPlanner, root::BeliefNode, rng::AbstractRNG;
                   pc_weight = planner.pc_weight, pc_penalty = planner.pc_penalty,
                   reward_mode = planner.reward_mode,
                   terminal_penalty = planner.terminal_penalty,
+                  p_arrival = planner.p_arrival,
                   node_depth = 0, table = table, sigma_mode = planner.sigma_mode,
                   grid = planner.grid)
     end
@@ -1694,6 +1746,12 @@ workers are attached — so the flag can be flipped on without a Distributed clu
 and simply not parallelize.
 """
 function plan_parallel(planner::MCTSPlanner, root::BeliefNode, rng::AbstractRNG)
+    # :fast is invalid under probabilistic arrival (stochastic per-branch debris Σ);
+    # guard here too since plan_parallel builds the table directly (see run_sims!).
+    if planner.sigma_mode == :fast && planner.p_arrival < 1.0
+        error("sigma_mode = :fast is invalid with p_arrival = $(planner.p_arrival) < 1.0 " *
+              "(stochastic debris arrival breaks the branch-invariant Σ table). Use :exact.")
+    end
     master_seed = rand(rng, UInt)
 
     # available worker processes (procs other than the coordinator). If the caller

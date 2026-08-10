@@ -81,6 +81,7 @@ function main()
         truncate_safe     = Bool(getk("truncate_safe", false)),
         dt                = Float64(getk("dt", 60 * 60)),
         grid_mode         = Symbol(getk("grid_mode", "measurement")),
+        p_arrival         = Float64(getk("p_arrival", 1.0)),
         verbose           = Bool(getk("verbose", true)),
     )
     # pass-through of the optional overrides episode_config keys but leaves nothing

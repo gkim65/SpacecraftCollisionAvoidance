@@ -205,7 +205,7 @@ function run_episode(planner::MCTSPlanner, pomdp::SpacecraftCAPOMDP, s0::CAState
                 pc_penalty = planner.pc_penalty, sigma_mode = planner.sigma_mode,
                 parallel = planner.parallel, n_workers = planner.n_workers,
                 reward_mode = planner.reward_mode, terminal_penalty = planner.terminal_penalty,
-                grid = g)
+                p_arrival = planner.p_arrival, grid = g)
         end
         exec_grid = step_planner.grid
 
@@ -232,12 +232,16 @@ function run_episode(planner::MCTSPlanner, pomdp::SpacecraftCAPOMDP, s0::CAState
         #    → cadence-aware correct) — identical to what the planner simulates. On
         #    the adaptive grid pass the grid + grid_depth=1 so the correction schedule
         #    matches the planner's first step exactly.
+        # p_arrival comes from the planner (single source of truth): the executed
+        # belief uses the SAME probabilistic debris-arrival model the rollouts do, so
+        # the planner reasons about arrival on the exact distribution it then faces.
         belief, since_sc, since_debris = step_belief(pomdp, belief, a, sp, rng;
                                                      dt = exec_dt,
                                                      cadence_sc = pomdp.cadence_sc,
                                                      cadence_debris = pomdp.cadence_debris,
                                                      since_sc = since_sc,
                                                      since_debris = since_debris,
+                                                     p_arrival = step_planner.p_arrival,
                                                      grid = exec_grid,
                                                      grid_depth = exec_grid === nothing ? nothing : 1)
 
@@ -336,6 +340,7 @@ function episode_config(; case_path::AbstractString,
                         pc_threshold::Union{Real,Nothing} = nothing,
                         max_steps::Union{Integer,Nothing} = nothing,
                         grid_mode::Symbol = :measurement,
+                        p_arrival::Real = 1.0,
                         policy::AbstractString = "mcts",
                         policy_params::Union{AbstractDict,Nothing} = nothing,
                         verbose::Bool = false)
@@ -359,6 +364,10 @@ function episode_config(; case_path::AbstractString,
         "pc_threshold"      => pc_threshold,
         "max_steps"         => max_steps,
         "grid_mode"         => String(grid_mode),
+        # p_arrival = P(a SCHEDULED debris measurement actually arrives). 1.0 (default)
+        # = the guaranteed-measurement model (byte-identical to pre-arrival runs); < 1
+        # makes each due debris fix a Bernoulli arrival, else predict-only that step.
+        "p_arrival"         => Float64(p_arrival),
         # policy = the DECISION rule this episode runs (F3 baseline comparison).
         # "mcts" (default) = the planner; "pc_gate"/"timing_gate" = the baselines.
         # policy_params carries the swept parameter for a gate ("theta" for pc_gate,
@@ -419,6 +428,7 @@ function run_episode_metrics(cfg::AbstractDict)
         coarse         = Float64(_cfg(cfg, "coarse", 8 * 3600))
         truncate_safe  = Bool(_cfg(cfg, "truncate_safe", false))
         grid_mode      = _sym(_cfg(cfg, "grid_mode", :measurement))
+        p_arrival      = Float64(_cfg(cfg, "p_arrival", 1.0))
 
         # 1. load the scenario. Only pass pc_threshold / t_horizon overrides when set.
         loader_kwargs = Dict{Symbol,Any}(:dt => dt, :sensor_quality => sensor_quality)
@@ -472,7 +482,8 @@ function run_episode_metrics(cfg::AbstractDict)
         planner = MCTSPlanner(pomdp; n_iterations = n_iterations, max_depth = grid_steps,
                               c = MCTS_UCB_C, k = k, dt = dt, sigma_mode = sigma_mode,
                               parallel = parallel, reward_mode = reward_mode,
-                              constraint_mode = constraint_mode, grid = root_grid)
+                              constraint_mode = constraint_mode, p_arrival = p_arrival,
+                              grid = root_grid)
         # `verbose=true` (config key) streams a per-step @info line AS EACH STEP
         # EXECUTES (run_episode's own live trace) — intermediate progress for long
         # / cluster runs, not just the final rolled-up dict.
@@ -639,6 +650,7 @@ function _episode_metrics_dict(cfg, sc, pomdp, trace, root_grid, spine_pc,
             "dt_h"            => pomdp.dt / 3600,
             "pc_threshold"    => thr,
             "delta_v_mps"     => pomdp.Δv,
+            "p_arrival"       => Float64(_cfg(cfg, "p_arrival", 1.0)),
             "policy"          => String(_cfg(cfg, "policy", "mcts")),
             "policy_params"   => _cfg(cfg, "policy_params", nothing),
         ),

@@ -1,10 +1,12 @@
 # =============================================================================
 # sweep_mcts_all.yaml — MCTS across ALL cadences, in a FRESH project (clean run).
 #
-# One sweep = the mcts policy over cadence {24,8,4,2} × 8 cases × 3 quality × 5
-# seeds = 480 episodes. Logs to a NEW project (spacecraftCA-mcts-clean) so it does
-# not mix with earlier (pre-seed-fix) runs. Run with a MODEST agent count (~28) so
-# the heavy 2 h cells never oversubscribe memory/cores (they are the slow tail).
+# One sweep = the mcts policy over cadence {4,2} × 8 cases × 3 quality × 5 seeds ×
+# p_arrival {1.0,0.9,0.75,0.5} = 960 episodes. The p_arrival=1.0 slice reproduces
+# the guaranteed-measurement results exactly (regression anchor). Logs to a NEW
+# project (spacecraftCA-mcts-clean) so it does not mix with earlier (pre-seed-fix)
+# runs. Run with a MODEST agent count (~28) so the heavy 2 h cells never
+# oversubscribe memory/cores (they are the slow tail).
 #
 # This is the "simplest" clean-slate variant (Grace 2026-08-10): just the method
 # (MCTS), all cadences, one sweep ID, one project. Baselines/gates are a separate
@@ -26,7 +28,7 @@ command:
 
 parameters:
   cadence_h:
-    values: [24, 8, 4, 2]              # longest-first so cheap cells finish first
+    values: [4, 2]                     # FINE cadences only (the wait-and-measure regime)
   case_path:
     values:
       - data/cara_cdms/000040059_conj_000035921_20220326_194122_20220325_215435.cdm
@@ -43,6 +45,15 @@ parameters:
     values: [1, 2, 3, 4, 5]
   policy_variant:
     values: [mcts]
+  # PROBABILISTIC MEASUREMENT ARRIVAL (F5). P(a SCHEDULED debris SSN/TLE fix
+  # actually arrives). 1.0 = the guaranteed-measurement anchor (byte-identical to
+  # the pre-arrival sweep — the regression baseline). <1 makes each due debris fix
+  # a Bernoulli arrival, else predict-only that step (Σ grows, no innovation) — the
+  # regime where reasoning about arrival (MCTS) beats committing blind (a fixed
+  # clock). 4 points to read the SHAPE of the edge-vs-p curve; a targeted fine
+  # fill-in (à la sweep_mcts_25994_fine.yaml) follows if the curve warrants it.
+  p_arrival:
+    values: [1.0, 0.9, 0.75, 0.5]
 
   # ---- fixed knobs ----
   sigma_mode:
