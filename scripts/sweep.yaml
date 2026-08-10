@@ -63,6 +63,24 @@ parameters:
   seed:
     values: [1, 2, 3, 4, 5]
 
+  # DECISION POLICY (F3 baseline comparison, single FLAT axis — Grace 2026-08-10).
+  # ONE `policy_variant` axis holds MCTS + every baseline as a plain string, so the
+  # grid has NO invalid cells (no "mcts × T_act" waste) and ALL policies live in ONE
+  # sweep. run_episode_entry.jl maps each string → (policy, policy_params) via
+  # baselines.policy_variant_spec. Every variant runs the SAME run_episode loop
+  # (same belief, grid, metrics, obs draws) so the comparison isolates the DECISION.
+  #   mcts             — the belief-space MCTS planner (the method).
+  #   wait_feasibility — baseline (2): idealized precompute-once wait-feasibility
+  #                      oracle (defers while the clean no-drift WAIT-spine is durably
+  #                      <δ; else maneuvers). A near-ORACLE upper reference.
+  #   delay_<N>h       — baseline (1): delay-clock gate, fixed δ=1e-5, single-burn,
+  #                      knob = act-time N h (force-defer until t<N, then burn if Pc>δ).
+  # NOTE: this multiplies the grid by the number of variants — 6 here × the 480-cell
+  # base = 2880 episodes. The gate variants are CHEAP (no MCTS), so most cells are
+  # fast; only the `mcts` variant pays the ~150 s/episode search cost.
+  policy_variant:
+    values: [mcts, wait_feasibility, delay_28h, delay_12h, delay_6h, delay_3h]
+
   # ---- fixed knobs (single-value => constant across the sweep) ----
   sigma_mode:
     value: exact

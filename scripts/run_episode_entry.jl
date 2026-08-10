@@ -90,6 +90,24 @@ function main()
     pt = getk("pc_threshold", nothing); pt !== nothing && (cfg["pc_threshold"] = Float64(pt))
     ms = getk("max_steps", nothing); ms !== nothing && (cfg["max_steps"] = Int(ms))
 
+    # DECISION POLICY (F3 baseline comparison). Two ways to set it from a config:
+    #  • `policy_variant` (the sweep-friendly SINGLE flat axis, Grace's call): one
+    #    string like "mcts" / "wait_feasibility" / "delay_12h" mapped to
+    #    (policy, policy_params) via `policy_variant_spec` — so ALL baselines live in
+    #    ONE sweep axis with no invalid grid cells.
+    #  • explicit `policy` + `policy_params` (direct override; wins if given).
+    # Absent both → defaults to "mcts" (unchanged behavior).
+    pv = getk("policy_variant", nothing)
+    if getk("policy", nothing) !== nothing
+        cfg["policy"] = String(raw["policy"])
+        pp = getk("policy_params", nothing)
+        cfg["policy_params"] = pp === nothing ? nothing : Dict{String,Any}(String(k) => v for (k, v) in pp)
+    elseif pv !== nothing
+        pk, pp = policy_variant_spec(String(pv))
+        cfg["policy"] = pk
+        cfg["policy_params"] = pp
+    end
+
     @info "run_episode_entry: running one episode" case=basename(cp) quality=cfg["sensor_quality"] cadence_h=(cfg["cadence_secondary"]===nothing ? "tier" : cfg["cadence_secondary"]/3600) seed=cfg["seed"] grid_mode=cfg["grid_mode"]
 
     metrics = run_episode_metrics(cfg)

@@ -64,18 +64,69 @@ struct ExecStep
 end
 
 """
-    run_episode(planner, pomdp, s0, rng; correct_at_root=pomdp.correct_at_root,
+    mcts_policy
+
+The DEFAULT decision policy for `run_episode`: the belief-space MCTS planner. It
+just runs one `plan(step_planner, root, rng)` and returns the best action, so a
+`run_episode` call with no `policy` argument behaves byte-for-byte as before the
+policy refactor. It is a plain function (not a closure) so it can be imported and
+compared against the baseline policies (`src/utils/baselines.jl`) on the identical
+`run_episode` loop — the whole point of the F3 comparison is that the DECISION rule
+is the only thing that varies; the belief update, grid, metrics, and observation
+draws are shared.
+
+Policy contract (all policies, `mcts_policy` + the baselines): a policy is a
+function
+
+    policy(pomdp, root, rng; planner, t_remaining, grid, pc_threshold,
+           delta_v, step) -> CAAction
+
+called ONCE per executed step at the single decision point in `run_episode` (the
+`plan` call it replaces). `root` is the fresh `BeliefNode` carrying the CURRENT
+tracked belief + true state + cadence phase; `t_remaining` is time-to-TCA (s) at
+the step; `planner` is the fully-configured `MCTSPlanner` for this step (the
+default policy uses it; the gate baselines ignore it and read Pc off `root`).
+Every gate reads Pc from the SAME (possibly noisy / drifted) belief the MCTS
+planner sees — `node_pc_at_tca(pomdp, root)` — never the truth: that is the crux
+of a fair comparison. `grid` / `pc_threshold` / `delta_v` / `step` are the
+remaining decision context (the timing gate needs `t_remaining` + `pc_threshold`).
+"""
+function mcts_policy(pomdp::SpacecraftCAPOMDP, root::BeliefNode, rng::AbstractRNG;
+                     planner::MCTSPlanner, t_remaining::Real = root.belief.t,
+                     grid = nothing, pc_threshold::Real = pomdp.pc_threshold,
+                     delta_v::Real = pomdp.Δv, step::Int = 0)
+    a, _ = plan(planner, root, rng)
+    return a
+end
+
+"""
+    run_episode(planner, pomdp, s0, rng; policy=mcts_policy,
+                correct_at_root=pomdp.correct_at_root,
                 max_steps=planner.max_depth, verbose=false) -> Vector{ExecStep}
 
 Run one closed-loop (receding-horizon / MPC) episode from true state `s0`:
-plan → execute → advance the true state → update the belief → re-plan, until TCA
-or collision (`isterminal`) or `max_steps` is hit. Returns the per-step trace.
+DECIDE (via `policy`) → execute → advance the true state → update the belief →
+re-decide, until TCA or collision (`isterminal`) or `max_steps` is hit. Returns
+the per-step trace.
+
+`policy` is the DECISION rule swapped in at the single decision point (see
+`mcts_policy` for the contract). It defaults to `mcts_policy` (run the planner), so
+the default call is unchanged from before the refactor. The F3 baseline policies
+(`src/utils/baselines.jl`) slot in here to get the IDENTICAL belief update (incl.
+the noisy drift), grid, metrics, and observation draws — the comparison isolates
+the decision rule only.
+
+`b0` is the STARTING tracked belief. For the CDM pipeline pass the loader's
+back-propagated DETECTION seed (`sc.b0`); `nothing` (default) falls back to a fresh
+`belief_from_pomdp` P0 (the synthetic-suite path, byte-identical). See the belief-
+init comment below for why the seed choice is load-bearing (a fresh P0 grows the
+raw CDM-TCA covariance forward and reads Pc ~100× below CARA).
 
 The belief is tracked across steps with the SAME `step_belief` update the planner
 uses internally (predict → sample z → cadence-aware correct), including the
 per-object cadence timers and the `correct_at_root` phase, so the executed belief
-is consistent with what each `plan` call assumed. A fresh root node is built each
-step from the CURRENT belief + true state, and one `plan` call decides that step's
+is consistent with what each decision assumed. A fresh root node is built each
+step from the CURRENT belief + true state, and one policy call decides that step's
 action. All planner knobs (sigma_mode / parallel / constraint_mode / dt /
 cadences) are used as configured on `planner`.
 
@@ -85,9 +136,12 @@ seeded RNG for a reproducible episode. `pomdp.dt` and `planner.dt` must match
 """
 function run_episode(planner::MCTSPlanner, pomdp::SpacecraftCAPOMDP, s0::CAState,
                      rng::AbstractRNG;
+                     policy = mcts_policy,
+                     b0::Union{Belief,Nothing} = nothing,
                      correct_at_root::Bool = pomdp.correct_at_root,
                      max_steps::Int = planner.max_depth,
                      grid_builder = nothing,
+                     final_state_ref::Union{Base.RefValue,Nothing} = nothing,
                      verbose::Bool = false)
     # dt-consistency: on the FIXED grid the true state advances by pomdp.dt, so the
     # planner must simulate that same step (asserted). On the ADAPTIVE grid the step
@@ -102,11 +156,21 @@ function run_episode(planner::MCTSPlanner, pomdp::SpacecraftCAPOMDP, s0::CAState
 
     trace = ExecStep[]
 
-    # Current true state + tracked belief. The belief starts at P0 anchored on the
-    # true state (root_from_pomdp / belief_from_pomdp), and the cadence timers start
-    # per correct_at_root — exactly as the planner's root does.
+    # Current true state + tracked belief. When a `b0` is supplied (the CDM pipeline
+    # path) the executor STARTS from that belief — this MUST be the loader's
+    # back-propagated DETECTION seed (`sc.b0`, from `backprop_belief_to_detection`),
+    # NOT a fresh `belief_from_pomdp` P0. `belief_from_pomdp` anchors `pomdp.P0_debris`
+    # (= the raw CDM-TCA covariance) at the DETECTION epoch and then grows it FORWARD
+    # to TCA, which smears the geometry and drives Pc-at-TCA ~100× BELOW CARA (the
+    # exact "forward-Pc→0" failure the back-prop fix, beliefMCTS.jl
+    # `backprop_belief_to_detection`, was built to prevent). So the closed-loop
+    # executor must track the SAME back-propagated seed the feasibility spine
+    # (`wait_spine_pc(pomdp, sc.b0, …)`) and the planner's rollouts assume — else the
+    # executed belief and the scoring spine sit on DIFFERENT covariances. `b0 ===
+    # nothing` (the synthetic-suite path) falls back to `belief_from_pomdp`, so those
+    # runs are byte-identical.
     s_true       = s0
-    belief       = belief_from_pomdp(pomdp, s0.sc_eci, s0.debris_eci, s0.t)
+    belief       = b0 === nothing ? belief_from_pomdp(pomdp, s0.sc_eci, s0.debris_eci, s0.t) : b0
     since_sc     = correct_at_root ? 0.0 : pomdp.cadence_sc
     since_debris = correct_at_root ? 0.0 : pomdp.cadence_debris
 
@@ -136,12 +200,19 @@ function run_episode(planner::MCTSPlanner, pomdp::SpacecraftCAPOMDP, s0::CAState
         end
         exec_grid = step_planner.grid
 
-        # 1. PLAN from the current belief + true state. Build a fresh root node
+        # 1. DECIDE from the current belief + true state. Build a fresh root node
         #    carrying the current belief, true state, and cadence-timer phase, then
-        #    run one plan. (The planner re-derives its own timers from the node.)
+        #    call the policy for this step's action. The DEFAULT policy (`mcts_policy`)
+        #    runs one `plan(step_planner, root, rng)` (the planner re-derives its own
+        #    timers from the node); a baseline policy (gate) reads Pc off THIS root's
+        #    belief instead — the SAME (possibly noisy) belief the planner would see,
+        #    so the comparison isolates the decision rule. `exec_grid` (built above) is
+        #    passed so a timing gate can see the step's grid context if it wants.
         root = BeliefNode(belief, s_true, isterminal(pomdp, s_true);
                           since_sc = since_sc, since_debris = since_debris)
-        a, _ = plan(step_planner, root, rng)
+        a = policy(pomdp, root, rng; planner = step_planner, t_remaining = t_remaining,
+                   grid = exec_grid, pc_threshold = pomdp.pc_threshold,
+                   delta_v = pomdp.Δv, step = step)
 
         # 2. EXECUTE: advance the TRUE state. Fixed grid ⇒ pomdp.dt; adaptive grid
         #    ⇒ the grid's first epoch gap (the step the plan actually decided).
@@ -178,6 +249,10 @@ function run_episode(planner::MCTSPlanner, pomdp::SpacecraftCAPOMDP, s0::CAState
         # advance the true state; re-plan from here next iteration.
         s_true = sp
     end
+    # Capture the final executed TRUE state (at TCA / collision) for the caller — the
+    # `outcome_pc` common-yardstick score (baselines.jl) needs where the policy
+    # actually steered the objects. Additive: the return contract stays the trace.
+    final_state_ref !== nothing && (final_state_ref[] = s_true)
     return trace
 end
 
@@ -249,6 +324,8 @@ function episode_config(; case_path::AbstractString,
                         pc_threshold::Union{Real,Nothing} = nothing,
                         max_steps::Union{Integer,Nothing} = nothing,
                         grid_mode::Symbol = :measurement,
+                        policy::AbstractString = "mcts",
+                        policy_params::Union{AbstractDict,Nothing} = nothing,
                         verbose::Bool = false)
     return Dict{String,Any}(
         "case_path"         => String(case_path),
@@ -270,6 +347,12 @@ function episode_config(; case_path::AbstractString,
         "pc_threshold"      => pc_threshold,
         "max_steps"         => max_steps,
         "grid_mode"         => String(grid_mode),
+        # policy = the DECISION rule this episode runs (F3 baseline comparison).
+        # "mcts" (default) = the planner; "pc_gate"/"timing_gate" = the baselines.
+        # policy_params carries the swept parameter for a gate ("theta" for pc_gate,
+        # "T_trigger_h" for timing_gate); nothing for mcts. See baselines.make_policy.
+        "policy"            => String(policy),
+        "policy_params"     => policy_params,
         "verbose"           => verbose,
     )
 end
@@ -382,8 +465,24 @@ function run_episode_metrics(cfg::AbstractDict)
         # EXECUTES (run_episode's own live trace) — intermediate progress for long
         # / cluster runs, not just the final rolled-up dict.
         verbose = Bool(_cfg(cfg, "verbose", false))
+        # DECISION POLICY (F3 baseline comparison). "mcts" (default) = the planner;
+        # a gate baseline reads Pc off the same belief and decides without MCTS. The
+        # policy slots into the SAME run_episode loop → identical belief update /
+        # grid / metrics / observation draws → the comparison isolates the decision.
+        policy_kind   = String(_cfg(cfg, "policy", "mcts"))
+        policy_params = _cfg(cfg, "policy_params", nothing)
+        policy_spec   = Dict{String,Any}("kind" => policy_kind)
+        if policy_params !== nothing
+            for (kk, vv) in policy_params; policy_spec[String(kk)] = vv; end
+        end
+        policy = make_policy(policy_spec)
         rng = MersenneTwister(seed)
+        # START the executor from the loader's back-propagated DETECTION seed sc.b0
+        # (NOT a fresh belief_from_pomdp P0) so the executed belief sits on the SAME
+        # covariance as the feasibility spine + the planner rollouts (see the belief-
+        # init comment in run_episode). This was the executor-seed fix (2026-08-10).
         trace = run_episode(planner, pomdp, sc.s_true, rng;
+                            policy = policy, b0 = sc.b0,
                             max_steps = max_steps, grid_builder = grid_builder,
                             verbose = verbose)
 
@@ -519,6 +618,8 @@ function _episode_metrics_dict(cfg, sc, pomdp, trace, root_grid, spine_pc,
             "dt_h"            => pomdp.dt / 3600,
             "pc_threshold"    => thr,
             "delta_v_mps"     => pomdp.Δv,
+            "policy"          => String(_cfg(cfg, "policy", "mcts")),
+            "policy_params"   => _cfg(cfg, "policy_params", nothing),
         ),
         # ---- scenario provenance ----
         "name1"          => sc.name1,
