@@ -1,0 +1,65 @@
+# =============================================================================
+# sweep_gates.yaml — COST-SPLIT sweep A: the CHEAP gate baselines (all cadences).
+#
+# This is one of a 3-way COST SPLIT of the full policy grid (see scripts/sweep.yaml
+# for the canonical single-sweep reference + the SPLIT_LAUNCH.md cheatsheet). The
+# split exists because wandb `grid` is a cartesian product and cannot exclude the one
+# expensive combination (mcts × 2 h cadence), which oversubscribed memory on a prior
+# run. Each split file is a clean grid with NO wasted cells:
+#
+#   A  sweep_gates.yaml    — 5 gate variants × cadence {24,8,4,2}   (CHEAP; run wide)
+#   B  sweep_mcts.yaml     — mcts × cadence {24,8,4}                (moderate)
+#   C  sweep_mcts_2h.yaml  — mcts × cadence {2} ONLY                (HEAVY; ~28 agents)
+#
+# ALL three log to the SAME project (spacecraftCA-belief-mcts) with the SAME metrics
+# schema, so at figure time you query the project (or filter by config) and every
+# run comes back together — the 3 sweep IDs are an execution/memory convenience, not
+# a data split. This file (A): the gate baselines have NO MCTS, so every cell is fast
+# — run it wide (~78 agents).
+#
+# GATES: 5 gate variants × 8 cases × 3 quality × 4 cadence × 5 seeds = 4800 cells,
+# each ~seconds. (delay_28h/12h/6h/3h + wait_feasibility.)
+# =============================================================================
+
+program: scripts/wandb_runner.py
+method: grid
+project: spacecraftCA-belief-mcts
+entity: kmeans_gsopt
+
+command:
+  - uv
+  - run
+  - python
+  - ${program}
+
+parameters:
+  cadence_h:
+    values: [24, 8, 4, 2]           # gates are cheap at every cadence
+  case_path:
+    values:
+      - data/cara_cdms/000040059_conj_000035921_20220326_194122_20220325_215435.cdm
+      - data/cara_cdms/000040115_conj_000030660_20230721_100115_20230720_061903.cdm
+      - data/cara_cdms/000025994_conj_000026132_20220224_100307_20220221_225515.cdm
+      - data/cara_cdms/000038771_conj_000030802_20201216_182131_20201215_171306.cdm
+      - data/cara_cdms/000029108_conj_000034995_20220706_165058_20220705_143113.cdm
+      - data/cara_cdms/000037849_conj_000013512_20210612_084905_20210611_062043.cdm
+      - data/cara_cdms/000033591_conj_000042216_20211203_183431_20211202_153618.cdm
+      - data/cara_cdms/000028654_conj_000041835_20220106_193032_20220105_161142.cdm
+  sensor_quality:
+    values: [best, median, worst]
+  seed:
+    values: [1, 2, 3, 4, 5]
+  policy_variant:                   # GATES ONLY (no mcts here)
+    values: [wait_feasibility, delay_28h, delay_12h, delay_6h, delay_3h]
+
+  # ---- fixed knobs ----
+  sigma_mode:
+    value: exact
+  reward_mode:
+    value: terminal
+  constraint_mode:
+    value: penalize
+  grid_mode:
+    value: measurement
+  n_iterations:
+    value: 12

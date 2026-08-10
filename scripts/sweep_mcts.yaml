@@ -1,0 +1,55 @@
+# =============================================================================
+# sweep_mcts.yaml — COST-SPLIT sweep B: MCTS at the NON-2h cadences {24,8,4}.
+#
+# Part of the 3-way cost split (see sweep_gates.yaml header + SPLIT_LAUNCH.md). The
+# MCTS variant pays the ~150 s/episode search cost; at 24/8/4 h cadence the episodes
+# have few enough decision steps to be moderate. The heavy mcts × 2 h cells are
+# ISOLATED in sweep_mcts_2h.yaml (sweep C) so they can be run with fewer agents.
+#
+# Same project + metrics schema as the other splits (joins at figure time).
+#
+# MCTS(non-2h): 1 variant × 8 cases × 3 quality × 3 cadence × 5 seeds = 360 cells.
+# =============================================================================
+
+program: scripts/wandb_runner.py
+method: grid
+project: spacecraftCA-belief-mcts
+entity: kmeans_gsopt
+
+command:
+  - uv
+  - run
+  - python
+  - ${program}
+
+parameters:
+  cadence_h:
+    values: [24, 8, 4]              # NON-2h cadences (2h is in sweep_mcts_2h.yaml)
+  case_path:
+    values:
+      - data/cara_cdms/000040059_conj_000035921_20220326_194122_20220325_215435.cdm
+      - data/cara_cdms/000040115_conj_000030660_20230721_100115_20230720_061903.cdm
+      - data/cara_cdms/000025994_conj_000026132_20220224_100307_20220221_225515.cdm
+      - data/cara_cdms/000038771_conj_000030802_20201216_182131_20201215_171306.cdm
+      - data/cara_cdms/000029108_conj_000034995_20220706_165058_20220705_143113.cdm
+      - data/cara_cdms/000037849_conj_000013512_20210612_084905_20210611_062043.cdm
+      - data/cara_cdms/000033591_conj_000042216_20211203_183431_20211202_153618.cdm
+      - data/cara_cdms/000028654_conj_000041835_20220106_193032_20220105_161142.cdm
+  sensor_quality:
+    values: [best, median, worst]
+  seed:
+    values: [1, 2, 3, 4, 5]
+  policy_variant:
+    values: [mcts]                  # MCTS only
+
+  # ---- fixed knobs ----
+  sigma_mode:
+    value: exact
+  reward_mode:
+    value: terminal
+  constraint_mode:
+    value: penalize
+  grid_mode:
+    value: measurement
+  n_iterations:
+    value: 12

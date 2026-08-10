@@ -61,6 +61,15 @@ struct ExecStep
     Δv::Float64
     pc::Float64
     miss::Float64
+    # Full tracked belief covariance (6×6 ECI, mean+velocity) for BOTH objects at
+    # THIS step's post-step belief — so a trace can show Σ growing (predict) and
+    # shrinking (measurement) over the episode, and diagnose drift (the whole
+    # tracking-fidelity story). The STARTING seed Σ is logged separately in the
+    # metrics dict's provenance (`b0_sigma_*`), so both the beginning and every step
+    # are recoverable. These are the tracked belief Σ at the node epoch (NOT grown to
+    # TCA); `pc` above is Pc-at-TCA from these grown to TCA.
+    sigma_sc::Matrix{Float64}
+    sigma_debris::Matrix{Float64}
 end
 
 """
@@ -240,7 +249,10 @@ function run_episode(planner::MCTSPlanner, pomdp::SpacecraftCAPOMDP, s0::CAState
         pc   = node_pc_at_tca(pomdp, post)
         Δv   = a == MANEUVER ? pomdp.Δv : 0.0
         miss = miss_distance(sp)
-        push!(trace, ExecStep(step, t_remaining, a, Δv, pc, miss))
+        # capture the FULL tracked belief Σ (6×6 ECI) for both objects at this step's
+        # post-step belief — for the covariance trace (growth/shrink/drift diagnosis).
+        push!(trace, ExecStep(step, t_remaining, a, Δv, pc, miss,
+                              Matrix{Float64}(belief.sc.Σ), Matrix{Float64}(belief.debris.Σ)))
 
         if verbose
             @info "executed step" step=step t_h=round(t_remaining/3600, digits=2) action=a Δv=Δv pc=pc miss_km=round(miss/1000, digits=3)
@@ -510,6 +522,11 @@ function _episode_metrics_dict(cfg, sc, pomdp, trace, root_grid, spine_pc,
     epochs_h = [t / 3600 for t in root_grid.t_epochs]
 
     # --- per-step trace as a list of flat dicts (t descending; maneuver flag) ---
+    # The full 6×6 belief Σ (both objects) is flattened ROW-MAJOR to a 36-vector
+    # (`sigma_*_eci_flat`) so it stays JSON-/wandb-Table-serializable (the hand-rolled
+    # JSON writers handle flat vectors, not matrices); `reshape(v,6,6)'` recovers the
+    # matrix. `sigma_*_pos_m` is the convenience position σ = √ of the ECI position-
+    # block diagonal (m), the quick read on Σ growth/shrink/drift over the episode.
     trace_rows = [Dict{String,Any}(
         "step"          => s.step,
         "t_remaining_h" => s.t_remaining / 3600,
@@ -517,6 +534,10 @@ function _episode_metrics_dict(cfg, sc, pomdp, trace, root_grid, spine_pc,
         "dv"            => s.Δv,
         "pc"            => s.pc,
         "miss_m"        => s.miss,
+        "sigma_sc_eci_flat"     => vec(permutedims(s.sigma_sc)),
+        "sigma_debris_eci_flat" => vec(permutedims(s.sigma_debris)),
+        "sigma_sc_pos_m"     => sqrt.(abs.(diag(s.sigma_sc)[1:3])),
+        "sigma_debris_pos_m" => sqrt.(abs.(diag(s.sigma_debris)[1:3])),
     ) for s in trace]
 
     n_steps      = length(trace)
@@ -634,6 +655,15 @@ function _episode_metrics_dict(cfg, sc, pomdp, trace, root_grid, spine_pc,
         "pc_cdm"         => sc.pc_cdm,
         "valid_2d"       => sc.valid,
         "tca"            => sc.tca,
+        # ---- STARTING seed belief covariance (sc.b0, the back-propagated detection
+        #      seed the executor now starts from) — the "beginning" Σ Grace wants
+        #      tracked alongside the per-step trace Σ. Full 6×6 flattened row-major
+        #      (reshape(v,6,6)') + the position σ (√ ECI position-block diag, m). ----
+        "b0_sigma_sc_eci_flat"     => vec(permutedims(Matrix{Float64}(sc.b0.sc.Σ))),
+        "b0_sigma_debris_eci_flat" => vec(permutedims(Matrix{Float64}(sc.b0.debris.Σ))),
+        "b0_sigma_sc_pos_m"        => sqrt.(abs.(diag(sc.b0.sc.Σ)[1:3])),
+        "b0_sigma_debris_pos_m"    => sqrt.(abs.(diag(sc.b0.debris.Σ)[1:3])),
+        "b0_t_remaining_h"         => sc.b0.t / 3600,
         # ---- core metrics ----
         "resolved_without_maneuver" => resolved_no_maneuver,
         "peak_pc"        => peak_pc,

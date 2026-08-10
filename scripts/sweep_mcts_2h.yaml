@@ -1,0 +1,57 @@
+# =============================================================================
+# sweep_mcts_2h.yaml — COST-SPLIT sweep C: the HEAVY cells (MCTS × 2 h cadence).
+#
+# Part of the 3-way cost split (see sweep_gates.yaml header + SPLIT_LAUNCH.md). These
+# are the most expensive episodes: MCTS (~150 s/plan) × the 2 h cadence (the MOST
+# decision steps, ~12 per episode) → minutes each. A prior run oversubscribed memory
+# fanning these out too wide, so they are ISOLATED here to be launched with FEWER
+# agents (~28) than the cheap sweeps.
+#
+# Same project + metrics schema as the other splits (joins at figure time).
+#
+# MCTS × 2h: 1 variant × 8 cases × 3 quality × 1 cadence × 5 seeds = 120 cells,
+# each minutes — the tail. Run with ~28 agents (memory-safe), NOT ~78.
+# =============================================================================
+
+program: scripts/wandb_runner.py
+method: grid
+project: spacecraftCA-belief-mcts
+entity: kmeans_gsopt
+
+command:
+  - uv
+  - run
+  - python
+  - ${program}
+
+parameters:
+  cadence_h:
+    values: [2]                     # the HEAVY cadence ONLY
+  case_path:
+    values:
+      - data/cara_cdms/000040059_conj_000035921_20220326_194122_20220325_215435.cdm
+      - data/cara_cdms/000040115_conj_000030660_20230721_100115_20230720_061903.cdm
+      - data/cara_cdms/000025994_conj_000026132_20220224_100307_20220221_225515.cdm
+      - data/cara_cdms/000038771_conj_000030802_20201216_182131_20201215_171306.cdm
+      - data/cara_cdms/000029108_conj_000034995_20220706_165058_20220705_143113.cdm
+      - data/cara_cdms/000037849_conj_000013512_20210612_084905_20210611_062043.cdm
+      - data/cara_cdms/000033591_conj_000042216_20211203_183431_20211202_153618.cdm
+      - data/cara_cdms/000028654_conj_000041835_20220106_193032_20220105_161142.cdm
+  sensor_quality:
+    values: [best, median, worst]
+  seed:
+    values: [1, 2, 3, 4, 5]
+  policy_variant:
+    values: [mcts]                  # MCTS only
+
+  # ---- fixed knobs ----
+  sigma_mode:
+    value: exact
+  reward_mode:
+    value: terminal
+  constraint_mode:
+    value: penalize
+  grid_mode:
+    value: measurement
+  n_iterations:
+    value: 12

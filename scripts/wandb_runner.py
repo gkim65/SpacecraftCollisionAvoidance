@@ -182,6 +182,12 @@ def _build_cfg_from_args(args):
     cfg["reward_mode"] = args.reward_mode
     cfg["constraint_mode"] = args.constraint_mode
     cfg["grid_mode"] = args.grid_mode
+    # DECISION POLICY (F3): a single flat variant string ("mcts" / "wait_feasibility" /
+    # "delay_<N>h"). run_episode_entry.jl maps it to (policy, policy_params). Default
+    # "mcts" keeps the pre-baseline behavior. (A sweep passes this via wandb.config;
+    # this is the single-run / sanity-check path.)
+    if getattr(args, "policy_variant", None) is not None:
+        cfg["policy_variant"] = args.policy_variant
     return cfg
 
 
@@ -193,6 +199,10 @@ def main():
                     choices=["best", "median", "worst"])
     ap.add_argument("--cadence-h", dest="cadence_h", type=float,
                     help="secondary measurement cadence in HOURS (e.g. 2,4,8,24)")
+    ap.add_argument("--policy-variant", dest="policy_variant",
+                    help="F3 decision policy: mcts | wait_feasibility | delay_<N>h "
+                         "(default mcts). Mapped to (policy, policy_params) by "
+                         "run_episode_entry.jl:policy_variant_spec.")
     ap.add_argument("--seed", type=int)
     ap.add_argument("--n-iterations", dest="n_iterations", type=int, default=12)
     ap.add_argument("--sigma-mode", dest="sigma_mode", default="exact")
