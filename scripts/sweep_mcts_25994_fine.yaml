@@ -1,0 +1,64 @@
+# =============================================================================
+# sweep_mcts_25994_fine.yaml — TARGETED FILL-IN for the 30 MCTS episodes that
+# failed (OOM) in the clean sweep.
+#
+# The clean MCTS sweep (project spacecraftCA-mcts-clean) finished 450/480. The 30
+# missing episodes are ALL one case — 000025994_conj_000026132 — at the FINE cadences
+# 2 h and 4 h (every quality x seed). Those are the heaviest MCTS cells (most decision
+# steps -> largest trees) and they oversubscribed RAM on the cluster run. This yaml
+# refills EXACTLY those 30 cells and nothing else, into the SAME project as the rest
+# of the clean MCTS data so it joins on export.
+#
+#   1 case x 2 cadence {4,2} x 3 quality x 5 seeds x 1 variant (mcts) = 30 episodes.
+#
+# MEMORY: these are the OOM cells. Launch with a SMALL agent count (~12-16, well under
+# the ~28 used for the general mcts x 2h split) so they never oversubscribe RAM — each
+# agent runs one heavy episode at a time. Longest-cadence-first (4 -> 2) so the 4 h
+# cells (cheaper) drain before the 2 h tail. All other knobs identical to sweep.yaml
+# (:exact, terminal reward, penalize, measurement grid, n_iterations=12) so the refilled
+# episodes are byte-comparable to the rest of the clean MCTS cohort.
+#
+# LAUNCH:
+#   wandb sweep scripts/sweep_mcts_25994_fine.yaml          # -> FILL_ID
+#   for i in $(seq 1 12); do
+#     tmux new-session -d "cd <repo> && wandb agent kmeans_gsopt/spacecraftCA-mcts-clean/FILL_ID"
+#   done
+# After it finishes: re-run scripts/export_sweep.py to pull the now-complete grid.
+# =============================================================================
+
+program: scripts/wandb_runner.py
+method: grid
+project: spacecraftCA-mcts-clean     # SAME project as the rest of the clean MCTS runs
+entity: kmeans_gsopt
+
+command:
+  - uv
+  - run
+  - python
+  - ${program}
+
+parameters:
+  cadence_h:
+    values: [4, 2]                   # the two FINE cadences that OOM'd (longest-first)
+  case_path:
+    values:
+      # the ONLY case with missing cells — the tiny-miss borderline debris conjunction
+      - data/cara_cdms/000025994_conj_000026132_20220224_100307_20220221_225515.cdm
+  sensor_quality:
+    values: [best, median, worst]
+  seed:
+    values: [1, 2, 3, 4, 5]
+  policy_variant:
+    values: [mcts]                   # MCTS only
+
+  # ---- fixed knobs (identical to sweep.yaml) ----
+  sigma_mode:
+    value: exact
+  reward_mode:
+    value: terminal
+  constraint_mode:
+    value: penalize
+  grid_mode:
+    value: measurement
+  n_iterations:
+    value: 12
