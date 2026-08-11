@@ -84,7 +84,7 @@ function delay_gate_policy(T_act::Real; pc_threshold::Union{Real,Nothing} = noth
                                planner = nothing, t_remaining::Real = root.belief.t,
                                grid = nothing,
                                pc_threshold::Real = pomdp.pc_threshold,
-                               delta_v::Real = pomdp.Δv, step::Int = 0)
+                               delta_v::Real = pomdp.Δv, step::Int = 0, kwargs...)
         burned[] && return WAIT              # latch: one burn per episode
         Float64(t_remaining) >= Tf && return WAIT   # forced defer — clock not reached
         thr = thrp === nothing ? Float64(pc_threshold) : thrp
@@ -145,7 +145,7 @@ function wait_feasibility_policy(; pc_threshold::Union{Real,Nothing} = nothing,
                               planner = nothing, t_remaining::Real = root.belief.t,
                               grid = nothing,
                               pc_threshold::Real = pomdp.pc_threshold,
-                              delta_v::Real = pomdp.Δv, step::Int = 0)
+                              delta_v::Real = pomdp.Δv, step::Int = 0, kwargs...)
         thr = thrp === nothing ? Float64(pc_threshold) : thrp
 
         # FIRST call: compute the clean spine ONCE from the (clean, un-drifted) root

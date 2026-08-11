@@ -837,4 +837,100 @@ end
         @test_throws ErrorException plan(pln_fast, rfast, MersenneTwister(1))
     end
 
+    # -----------------------------------------------------------------
+    @testset "16. Root chance constraint (mask on p_viol, rank on E[Pc]+fuel)" begin
+        # The 2026-08-11 rule (:chance): a ROOT action a is FEASIBLE iff p_viol(a) < α
+        # (p_viol = fraction of a's rollouts whose LEAF Pc-at-TCA > δ). Among the
+        # FEASIBLE actions pick argmax of the CLEAN value −pc_weight·E[Pc](a) −
+        # maneuver_cost·1[a is a burn] (the EXPECTATION objective + fuel; Qa and its
+        # in-tree 1e4 term are NOT used). If NONE is feasible fall back to
+        # least-infeasible = argmin_a E[Pc](a). :legacy keeps plain argmax-Qa (the
+        # pre-2026-08-11 soft-penalty decision, WITH 1e4) for regression.
+        #
+        # (a)/(b)/(c) exercise the DECISION LOGIC directly on hand-built per-action
+        # stats so the test is deterministic and instant. A `pomdp` supplies
+        # maneuver_cost (=10 default) / the MANEUVER burn flag for the fuel term.
+        cc_pomdp = SpacecraftCAPOMDP(seed = 42, randAdd = false)   # maneuver_cost = 10
+        acts = [WAIT, MANEUVER]
+        α = 0.05
+        pcw = MCTS_PC_REWARD_WEIGHT                                # 1e6
+
+        # (a) An action with p_viol ≥ α is MASKED when a feasible alternative exists.
+        #     WAIT: p_viol 0.30 (≥ α) → infeasible; MANEUVER: p_viol 0.0 (< α) → the
+        #     only feasible action ⇒ chosen, regardless of Qa. :legacy (or the old
+        #     argmax-Qa) would instead pick WAIT (its higher Qa).
+        Qa_a  = Dict(WAIT => -5.0, MANEUVER => -12.0)
+        st_a  = Dict(WAIT     => (n = 50, p_viol = 0.30, epc = 3.0e-4),
+                     MANEUVER => (n = 50, p_viol = 0.00, epc = 1.0e-9))
+        @test chance_constrained_action(cc_pomdp, acts, Qa_a, st_a; α = α, pc_weight = pcw, rule = :chance) == MANEUVER
+        @test chance_constrained_action(cc_pomdp, acts, Qa_a, st_a; α = α, pc_weight = pcw, rule = :legacy) == WAIT
+
+        # (b) ALL actions infeasible ⇒ least-infeasible fallback = argmin_a E[Pc].
+        #     Both p_viol ≥ α; MANEUVER has the LOWER mean leaf Pc, so it wins (Qa and
+        #     fuel are BOTH ignored in the over-δ fallback — only E[Pc] ranks).
+        Qa_b  = Dict(WAIT => -5.0, MANEUVER => -12.0)
+        st_b  = Dict(WAIT     => (n = 50, p_viol = 0.80, epc = 2.0e-3),
+                     MANEUVER => (n = 50, p_viol = 0.60, epc = 4.0e-4))
+        @test chance_constrained_action(cc_pomdp, acts, Qa_b, st_b; α = α, pc_weight = pcw, rule = :chance) == MANEUVER
+
+        # (c) KNIFE-EDGE + expectation ranking: a SINGLE violating rollout out of 50
+        #     (p_viol = 0.02 < α) keeps WAIT FEASIBLE, and the E[Pc]+fuel ranking then
+        #     DEFERS — the 38771 best-quality failure mode. WAIT E[Pc]=8e-6 (below δ):
+        #       clean(WAIT)     = −1e6·8e-6  − 0  = −8.0
+        #       clean(MANEUVER) = −1e6·1e-9  − 10 = −10.0    ⇒ WAIT wins (don't burn).
+        #     Under argmax-Qa (the OLD feasible rule) WAIT's lone −1e4 rollout would
+        #     have sunk its mean Qa below MANEUVER and flipped it — the bug this fixes.
+        Qa_c  = Dict(WAIT => -5000.0, MANEUVER => -12.0)   # WAIT Qa sunk by an in-tree 1e4
+        st_c  = Dict(WAIT     => (n = 50, p_viol = 1/50, epc = 8.0e-6),
+                     MANEUVER => (n = 50, p_viol = 0.00, epc = 1.0e-9))
+        @test chance_constrained_action(cc_pomdp, acts, Qa_c, st_c; α = α, pc_weight = pcw, rule = :chance) == WAIT
+        #     …and :legacy (argmax-Qa) DOES flip to MANEUVER on that same sunk Qa —
+        #     showing the two rules genuinely differ on the knife-edge.
+        @test chance_constrained_action(cc_pomdp, acts, Qa_c, st_c; α = α, pc_weight = pcw, rule = :legacy) == MANEUVER
+        #     …but if WAIT violated in 5 of 50 (p_viol = 0.10 ≥ α) it IS masked out —
+        #     the gate is at α, not at "any violation" → only MANEUVER feasible.
+        st_c2 = Dict(WAIT     => (n = 50, p_viol = 5/50, epc = 8.0e-6),
+                     MANEUVER => (n = 50, p_viol = 0.00, epc = 1.0e-9))
+        @test chance_constrained_action(cc_pomdp, acts, Qa_c, st_c2; α = α, pc_weight = pcw, rule = :chance) == MANEUVER
+
+        # (c') Among TWO feasible actions where waiting is genuinely riskier than δ,
+        #     the burn IS chosen: WAIT E[Pc]=5e-5 (5×δ) → clean(WAIT)=−50 <
+        #     clean(MANEUVER)=−1e6·1e-9−10=−10 ⇒ MANEUVER. Confirms the fuel term does
+        #     NOT make it defer unconditionally — the indifference point sits at δ.
+        st_c3 = Dict(WAIT     => (n = 50, p_viol = 0.00, epc = 5.0e-5),
+                     MANEUVER => (n = 50, p_viol = 0.00, epc = 1.0e-9))
+        @test chance_constrained_action(cc_pomdp, acts, Qa_c, st_c3; α = α, pc_weight = pcw, rule = :chance) == MANEUVER
+
+        # (d) The accumulators feed root_action_stats correctly: p_viol = viol/roll,
+        #     E[Pc] = pcsum/roll, and a zero-rollout action is omitted.
+        b0 = belief_from_pomdp(SpacecraftCAPOMDP(seed = 42, randAdd = false),
+                               zeros(6), zeros(6), 3600.0)
+        nd = BeliefNode(b0, CAState(zeros(6), zeros(6), 3600.0), false)
+        nd.roll_a[WAIT] = 50; nd.viol_a[WAIT] = 4; nd.pcsum_a[WAIT] = 50 * 2.0e-6
+        nd.roll_a[MANEUVER] = 50; nd.viol_a[MANEUVER] = 0; nd.pcsum_a[MANEUVER] = 0.0
+        s = root_action_stats(nd)
+        @test s[WAIT].n == 50 && isapprox(s[WAIT].p_viol, 4/50)
+        @test isapprox(s[WAIT].epc, 2.0e-6)
+        @test isapprox(s[MANEUVER].p_viol, 0.0)
+
+        # (e) END-TO-END through the real planner: the accumulators get populated over
+        #     the rollouts and plan() returns a decision consistent with the rule. Low
+        #     n_iter (fast); we assert the stats are present + sane, not a specific
+        #     action (that is the 38771 local validation's job).
+        pomdp = SpacecraftCAPOMDP(seed = 42, randAdd = false, dt = 60 * 60,
+                                  TCA_max = 3 * 60 * 60, Δv = 5.0)
+        s0 = make_conjunction_state(pomdp; miss_m = 200.0, v_rel = 15.0,
+                                    geometry = :cross_track, t = 3 * 60 * 60)
+        nsteps = Int(round(s0.t / pomdp.dt))
+        pln = MCTSPlanner(pomdp; n_iterations = 30, max_depth = nsteps, dt = pomdp.dt,
+                          sigma_mode = :exact, constraint_mode = :penalize)
+        r = root_from_pomdp(pomdp, s0)
+        a, _ = plan(pln, r, MersenneTwister(11))
+        @test a in (WAIT, MANEUVER)
+        stats = root_action_stats(r)
+        @test !isempty(stats)                                    # accumulators populated
+        @test sum(v.n for v in values(stats)) == 30              # every rollout tallied once
+        @test all(0.0 <= v.p_viol <= 1.0 for v in values(stats))
+    end
+
 end

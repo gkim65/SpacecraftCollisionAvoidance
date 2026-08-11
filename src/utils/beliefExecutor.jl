@@ -103,8 +103,19 @@ remaining decision context (the timing gate needs `t_remaining` + `pc_threshold`
 function mcts_policy(pomdp::SpacecraftCAPOMDP, root::BeliefNode, rng::AbstractRNG;
                      planner::MCTSPlanner, t_remaining::Real = root.belief.t,
                      grid = nothing, pc_threshold::Real = pomdp.pc_threshold,
-                     delta_v::Real = pomdp.Δv, step::Int = 0)
-    a, _ = plan(planner, root, rng)
+                     delta_v::Real = pomdp.Δv, step::Int = 0, verbose::Bool = false,
+                     kwargs...)
+    a, r = plan(planner, root, rng)
+    if verbose
+        # Per-decision chance-constraint trace: the ACTUAL per-root-action rollout
+        # count, p_viol = P̂[Pc(TCA)>δ | a], and E[Pc|a] — so we can confirm ~n_iter/2
+        # rollouts/action and see which actions the α gate masked. `α`/`rule` echo
+        # the constraint that produced `a` (the committed action).
+        stats = root_action_stats(r)
+        for (act, s) in stats
+            @info "root chance-constraint" step=step action=act n_rollouts=s.n p_viol=round(s.p_viol, digits=4) E_pc=s.epc α=planner.α_cc rule=planner.root_rule chosen=(act == a)
+        end
+    end
     return a
 end
 
@@ -205,7 +216,8 @@ function run_episode(planner::MCTSPlanner, pomdp::SpacecraftCAPOMDP, s0::CAState
                 pc_penalty = planner.pc_penalty, sigma_mode = planner.sigma_mode,
                 parallel = planner.parallel, n_workers = planner.n_workers,
                 reward_mode = planner.reward_mode, terminal_penalty = planner.terminal_penalty,
-                p_arrival = planner.p_arrival, grid = g)
+                p_arrival = planner.p_arrival, α_cc = planner.α_cc,
+                root_rule = planner.root_rule, grid = g)
         end
         exec_grid = step_planner.grid
 
@@ -221,7 +233,7 @@ function run_episode(planner::MCTSPlanner, pomdp::SpacecraftCAPOMDP, s0::CAState
                           since_sc = since_sc, since_debris = since_debris)
         a = policy(pomdp, root, rng; planner = step_planner, t_remaining = t_remaining,
                    grid = exec_grid, pc_threshold = pomdp.pc_threshold,
-                   delta_v = pomdp.Δv, step = step)
+                   delta_v = pomdp.Δv, step = step, verbose = verbose)
 
         # 2. EXECUTE: advance the TRUE state. Fixed grid ⇒ pomdp.dt; adaptive grid
         #    ⇒ the grid's first epoch gap (the step the plan actually decided).
@@ -341,6 +353,8 @@ function episode_config(; case_path::AbstractString,
                         max_steps::Union{Integer,Nothing} = nothing,
                         grid_mode::Symbol = :measurement,
                         p_arrival::Real = 1.0,
+                        α_cc::Real = MCTS_ALPHA,
+                        root_rule::Symbol = MCTS_ROOT_RULE,
                         policy::AbstractString = "mcts",
                         policy_params::Union{AbstractDict,Nothing} = nothing,
                         verbose::Bool = false)
@@ -368,6 +382,12 @@ function episode_config(; case_path::AbstractString,
         # = the guaranteed-measurement model (byte-identical to pre-arrival runs); < 1
         # makes each due debris fix a Bernoulli arrival, else predict-only that step.
         "p_arrival"         => Float64(p_arrival),
+        # α_cc = risk level of the ROOT chance constraint; root_rule selects the root
+        # decision rule (:chance = mask on p_viol < α + argmax-Qa on the feasible set,
+        # least-infeasible fallback; :legacy = plain argmax-Qa, the soft-penalty
+        # planner, for reproducing pre-2026-08-11 results). See MCTS_ALPHA/MCTS_ROOT_RULE.
+        "alpha_cc"          => Float64(α_cc),
+        "root_rule"         => String(root_rule),
         # policy = the DECISION rule this episode runs (F3 baseline comparison).
         # "mcts" (default) = the planner; "pc_gate"/"timing_gate" = the baselines.
         # policy_params carries the swept parameter for a gate ("theta" for pc_gate,
@@ -429,6 +449,8 @@ function run_episode_metrics(cfg::AbstractDict)
         truncate_safe  = Bool(_cfg(cfg, "truncate_safe", false))
         grid_mode      = _sym(_cfg(cfg, "grid_mode", :measurement))
         p_arrival      = Float64(_cfg(cfg, "p_arrival", 1.0))
+        α_cc           = Float64(_cfg(cfg, "alpha_cc", MCTS_ALPHA))
+        root_rule      = _sym(_cfg(cfg, "root_rule", MCTS_ROOT_RULE))
 
         # 1. load the scenario. Only pass pc_threshold / t_horizon overrides when set.
         loader_kwargs = Dict{Symbol,Any}(:dt => dt, :sensor_quality => sensor_quality)
@@ -483,6 +505,7 @@ function run_episode_metrics(cfg::AbstractDict)
                               c = MCTS_UCB_C, k = k, dt = dt, sigma_mode = sigma_mode,
                               parallel = parallel, reward_mode = reward_mode,
                               constraint_mode = constraint_mode, p_arrival = p_arrival,
+                              α_cc = α_cc, root_rule = root_rule,
                               grid = root_grid)
         # `verbose=true` (config key) streams a per-step @info line AS EACH STEP
         # EXECUTES (run_episode's own live trace) — intermediate progress for long
@@ -651,6 +674,8 @@ function _episode_metrics_dict(cfg, sc, pomdp, trace, root_grid, spine_pc,
             "pc_threshold"    => thr,
             "delta_v_mps"     => pomdp.Δv,
             "p_arrival"       => Float64(_cfg(cfg, "p_arrival", 1.0)),
+            "alpha_cc"        => Float64(_cfg(cfg, "alpha_cc", MCTS_ALPHA)),
+            "root_rule"       => String(_sym(_cfg(cfg, "root_rule", MCTS_ROOT_RULE))),
             "policy"          => String(_cfg(cfg, "policy", "mcts")),
             "policy_params"   => _cfg(cfg, "policy_params", nothing),
         ),

@@ -82,6 +82,8 @@ function main()
         dt                = Float64(getk("dt", 60 * 60)),
         grid_mode         = Symbol(getk("grid_mode", "measurement")),
         p_arrival         = Float64(getk("p_arrival", 1.0)),
+        α_cc              = Float64(getk("alpha_cc", MCTS_ALPHA)),
+        root_rule         = Symbol(getk("root_rule", String(MCTS_ROOT_RULE))),
         verbose           = Bool(getk("verbose", true)),
     )
     # pass-through of the optional overrides episode_config keys but leaves nothing

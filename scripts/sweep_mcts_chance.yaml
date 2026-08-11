@@ -1,0 +1,77 @@
+# =============================================================================
+# sweep_mcts_chance.yaml — MCTS under the TRUE ROOT CHANCE CONSTRAINT (2026-08-11).
+#
+# The chance-constraint cadence sweep: cadence {2,4,8,24} × 8 cases × 3 quality ×
+# 5 seeds = 480 episodes, p_arrival fixed at 1.0 (guaranteed measurement — no
+# arrival axis in this sweep). The ROOT decision uses the true chance constraint
+# (root_rule = chance): a root action is feasible iff its estimated
+# p_viol = P̂[Pc(TCA) > δ] < α; among feasible actions rank by −pc_weight·E[Pc] −
+# fuel; if none is feasible fall back to least-infeasible argmin_a E[Pc]. See
+# notes/chance_constraint_design_decision.md.
+#
+# PAIRED with sweep_mcts_legacy.yaml: IDENTICAL axes + seeds, root_rule=legacy
+# there. Same (case, quality, seed, cadence) cells → every chance cell has a legacy
+# twin, so any decision difference is attributable to the RULE alone (the 38771
+# best-quality validation: chance DEFERS, legacy panic-burns at step 1). Run the
+# two side by side; separate fresh projects so they don't mix.
+#
+# WHY n_iterations = 100 (NOT 12): α = 0.05 is a Monte-Carlo estimate from
+# ~n_iter/2 rollouts per action (2 actions), so the finest resolvable violation
+# fraction is ~2/n_iter. n_iter=100 (~50 rollouts/action, resolution ~0.02) makes
+# α=0.05 honestly estimable and kills the lone-violation knife-edge. Cadence axis
+# {2,4,8,24}: coarse 24h → fine 2h shows the wait-and-measure edge sharpen as more
+# decision points appear. The 2h cells are the slow / memory-heavy tail (12h
+# per-episode timeout below). Modest agent count (~28) so they don't oversubscribe.
+# =============================================================================
+
+program: scripts/wandb_runner.py
+method: grid
+project: spacecraftCA-mcts-chance      # FRESH project — chance-constraint sweep
+entity: kmeans_gsopt
+
+command:
+  - uv
+  - run
+  - python
+  - ${program}
+  - --timeout-s          # per-episode Julia timeout: 12 h. n_iter=100 is ~8×
+  - "43200"              # heavier than n_iter=12; the 2 h-cadence cells are slow.
+
+parameters:
+  cadence_h:
+    values: [2, 4, 8, 24]              # fine → coarse (wait-and-measure edge vs cadence)
+  case_path:
+    values:
+      - data/cara_cdms/000040059_conj_000035921_20220326_194122_20220325_215435.cdm
+      - data/cara_cdms/000040115_conj_000030660_20230721_100115_20230720_061903.cdm
+      - data/cara_cdms/000025994_conj_000026132_20220224_100307_20220221_225515.cdm
+      - data/cara_cdms/000038771_conj_000030802_20201216_182131_20201215_171306.cdm
+      - data/cara_cdms/000029108_conj_000034995_20220706_165058_20220705_143113.cdm
+      - data/cara_cdms/000037849_conj_000013512_20210612_084905_20210611_062043.cdm
+      - data/cara_cdms/000033591_conj_000042216_20211203_183431_20211202_153618.cdm
+      - data/cara_cdms/000028654_conj_000041835_20220106_193032_20220105_161142.cdm
+  sensor_quality:
+    values: [best, median, worst]
+  seed:
+    values: [1, 2, 3, 4, 5]
+  policy_variant:
+    values: [mcts]
+
+  # ---- fixed knobs ----
+  p_arrival:
+    value: 1.0                         # guaranteed measurement (no arrival axis here)
+  sigma_mode:
+    value: exact
+  reward_mode:
+    value: terminal
+  constraint_mode:
+    value: penalize                    # in-tree per-step handling (search unchanged)
+  grid_mode:
+    value: measurement
+  # ROOT CHANCE CONSTRAINT (the point of this sweep).
+  root_rule:
+    value: chance
+  alpha_cc:
+    value: 0.05                        # risk level (Blackmore/Ono); see CONSTANTS.md
+  n_iterations:
+    value: 100                         # ~50 rollouts/action → α=0.05 honestly estimable

@@ -144,6 +144,44 @@ const MCTS_REWARD_MODE = :terminal        # :terminal (default) | :per_step (leg
 # maneuver_cost; scaled to bind at δ, not an independently-measured quantity).
 const MCTS_TERMINAL_PENALTY = 1.0e4       # flat penalty when leaf Pc-at-TCA > threshold
 
+# --- ROOT chance-constraint risk level α + rule switch (2026-08-11; see
+# CONSTANTS.md + notes/chance_constraint_design_decision.md) --------------------
+# α is the RISK LEVEL of the true (root-only) chance constraint: a root action a
+# is FEASIBLE iff its estimated end-of-encounter violation probability
+#   p_viol(a) = P̂[Pc(TCA) > δ | a]  (fraction of rollouts through a whose leaf
+#   Pc-at-TCA exceeds the collision threshold δ = pomdp.pc_threshold)
+# is below α. α is DISTINCT from δ and must NOT be conflated with it: δ=1e-5 bounds
+# the tolerable collision probability given end-of-encounter uncertainty; α=0.05
+# bounds the probability, over measurement realizations, of FAILING to meet that
+# bound. α is a design knob trading conservatism vs fuel, NOT a relaxed collision
+# threshold.
+# SOURCE: Blackmore & Ono, "Convex Chance Constrained Predictive Control without
+# Sampling" (AIAA GNC 2009); Ono, Pavone, Kuwata, Balaram, "Chance-Constrained
+# Dynamic Programming with Application to Risk-Aware Robotic Space Exploration"
+# (Autonomous Robots 2015) — canonical chance-constraint framing P[violation] ≤ α
+# as a prescribed risk level separate from the constraint boundary; α=0.05 is the
+# common robust-control choice. Formulation anchor: Moss, Jamgochian, Fischer,
+# Corso, Kochenderfer, ConstrainedZero (IJCAI 2024, arXiv:2405.00644) — chance-
+# constrained POMDP via MCTS failure-probability estimation; we FIX α (they adapt
+# it via conformal inference).
+# α–n_iter coupling: p_viol is a Monte-Carlo estimate from ~n_iter/2 rollouts per
+# action, so the finest resolvable fraction is ~2/n_iter. n_iter=100 (~50
+# rollouts/action, resolution ~0.02) makes α=0.05 honestly estimable.
+const MCTS_ALPHA = 0.05   # chance-constraint risk level (Blackmore/Ono); root-only
+
+# ROOT DECISION RULE — which decision the executor commits to at the root:
+#   :chance (default) — the true root chance constraint. Mask root actions whose
+#       p_viol(a) ≥ α; among the FEASIBLE actions pick argmax Qa (the existing MCTS
+#       rule, restricted to the feasible set); if NONE is feasible fall back to the
+#       least-infeasible action argmin_a E[Pc](a). Removes the n_iter knife-edge via
+#       the feasibility mask (a 1/50 violation → p_viol=0.02<α stays feasible).
+#   :legacy — the pre-2026-08-11 behavior: plain argmax Qa over ALL actions (the
+#       soft-penalty planner), for reproducing the earlier results. Equivalent to
+#       :chance with α = Inf (every action feasible ⇒ pure argmax-Q).
+# The IN-TREE reward (per-step + leaf_value, incl. the 1e4 terminal penalty) is
+# UNCHANGED under both rules — the switch governs ONLY the root action selection.
+const MCTS_ROOT_RULE = :chance   # :chance (root chance constraint) | :legacy (argmax-Q)
+
 # Σ-propagation mode for the Pc eval (efficiency pass, 2026-07-23):
 #   :fast  — precompute the branch-invariant DEBRIS Σ-at-TCA per depth ONCE per
 #            plan, look it up per node; propagate only the debris MEAN + the full
@@ -440,6 +478,16 @@ mutable struct BeliefNode
     # --- Phase 6 Pc instrumentation (for the constraint + the ablation) -------
     pc::Float64                    # Pc-at-TCA from this node's belief (NaN = not yet computed)
     violated::Bool                 # did this node's Pc exceed pomdp.pc_threshold?
+    # --- root chance-constraint accumulators (2026-08-11) ---------------------
+    # Populated ONLY on the root node, one entry per root action a, over the plan's
+    # rollouts: how many rollouts descended through a (roll_a), how many of those
+    # ended at a LEAF with Pc-at-TCA > δ (viol_a), and the sum of those leaf Pcs
+    # (pcsum_a). They give p_viol(a) = viol_a/roll_a (the feasibility gate) and
+    # E[Pc](a) = pcsum_a/roll_a (the least-infeasible fallback ranking). Left empty
+    # on non-root nodes. See root_action_stats / chance_constrained_action.
+    roll_a::Dict{CAAction,Int}
+    viol_a::Dict{CAAction,Int}
+    pcsum_a::Dict{CAAction,Float64}
 end
 
 function BeliefNode(belief::Belief, s_true::CAState, is_terminal::Bool;
@@ -447,7 +495,9 @@ function BeliefNode(belief::Belief, s_true::CAState, is_terminal::Bool;
     return BeliefNode(belief, s_true, 0,
                       Dict{CAAction,Int}(), Dict{CAAction,Float64}(),
                       Dict{CAAction,Vector{BeliefNode}}(), is_terminal,
-                      Float64(since_sc), Float64(since_debris), NaN, false)
+                      Float64(since_sc), Float64(since_debris), NaN, false,
+                      Dict{CAAction,Int}(), Dict{CAAction,Int}(),
+                      Dict{CAAction,Float64}())
 end
 
 # =========================================================================
@@ -1364,9 +1414,16 @@ Run one MCTS simulation from `node` (architecture §4 steps 1–7). Selects an
 action by UCB, adds or reuses an observation-child under progressive widening,
 evaluates the Pc-based step reward + per-step chance constraint (§4 steps 5–6)
 on the child, recurses to `depth-1`, and backs up a running-average value.
-Returns the (discounted) return seen from this node. Terminal nodes and the
-depth==0 cutoff return the Pc-at-TCA `leaf_value` (§7). The `constraint_mode`,
-`pc_weight`, `pc_penalty` args are threaded into the reward and the leaf value.
+
+Returns `(q, leaf_pc)`: `q` is the (discounted) return seen from this node (the
+value that drives UCB/backup — UNCHANGED by this instrumentation), and `leaf_pc`
+is the Pc-at-TCA of the LEAF this rollout ultimately reached, bubbled up
+unchanged through the recursion. The caller at the ROOT (`node_depth == 0`) uses
+`leaf_pc` to accumulate the per-root-action chance-constraint statistics
+(`roll_a`/`viol_a`/`pcsum_a`); intermediate nodes just pass it through. Terminal
+nodes and the depth==0 cutoff return the Pc-at-TCA `leaf_value` (§7) as `q` and
+that same node's Pc as `leaf_pc`. The `constraint_mode`, `pc_weight`,
+`pc_penalty` args are threaded into the reward and the leaf value.
 """
 function simulate!(pomdp::SpacecraftCAPOMDP, node::BeliefNode, depth::Int,
                    rng::AbstractRNG; dt::Real = pomdp.dt,
@@ -1389,10 +1446,14 @@ function simulate!(pomdp::SpacecraftCAPOMDP, node::BeliefNode, depth::Int,
     # terminal reward is actually seen (the point of Part 2).
     grid_exhausted = grid !== nothing && node_depth >= grid_depth_count(grid)
     if node.is_terminal || depth <= 0 || grid_exhausted
-        return leaf_value(pomdp, node; constraint_mode = constraint_mode,
-                          pc_weight = pc_weight, pc_penalty = pc_penalty,
-                          reward_mode = reward_mode, terminal_penalty = terminal_penalty,
-                          depth = node_depth, table = table, sigma_mode = sigma_mode)
+        v = leaf_value(pomdp, node; constraint_mode = constraint_mode,
+                       pc_weight = pc_weight, pc_penalty = pc_penalty,
+                       reward_mode = reward_mode, terminal_penalty = terminal_penalty,
+                       depth = node_depth, table = table, sigma_mode = sigma_mode)
+        # leaf_value caches node.pc (the Pc-at-TCA of THIS leaf) — bubble it up so
+        # the root can attribute the rollout's end-of-encounter outcome to its
+        # originating root action.
+        return v, node.pc
     end
 
     node.N += 1
@@ -1427,23 +1488,38 @@ function simulate!(pomdp::SpacecraftCAPOMDP, node::BeliefNode, depth::Int,
                               depth = child_depth, table = table, sigma_mode = sigma_mode)
     end
 
-    q = r + POMDPs.discount(pomdp) * simulate!(pomdp, child, depth - 1, rng;
-                                               dt = dt, cadence_sc = cadence_sc,
-                                               cadence_debris = cadence_debris,
-                                               c = c, k = k, α = α,
-                                               constraint_mode = constraint_mode,
-                                               pc_weight = pc_weight, pc_penalty = pc_penalty,
-                                               reward_mode = reward_mode,
-                                               terminal_penalty = terminal_penalty,
-                                               p_arrival = p_arrival,
-                                               node_depth = child_depth,
-                                               table = table, sigma_mode = sigma_mode,
-                                               grid = grid)
+    q_child, leaf_pc = simulate!(pomdp, child, depth - 1, rng;
+                                 dt = dt, cadence_sc = cadence_sc,
+                                 cadence_debris = cadence_debris,
+                                 c = c, k = k, α = α,
+                                 constraint_mode = constraint_mode,
+                                 pc_weight = pc_weight, pc_penalty = pc_penalty,
+                                 reward_mode = reward_mode,
+                                 terminal_penalty = terminal_penalty,
+                                 p_arrival = p_arrival,
+                                 node_depth = child_depth,
+                                 table = table, sigma_mode = sigma_mode,
+                                 grid = grid)
+    q = r + POMDPs.discount(pomdp) * q_child
 
     # running-average backup on the per-action value
     node.Na[a] = na + 1
     node.Qa[a] = get(node.Qa, a, 0.0) + (q - get(node.Qa, a, 0.0)) / node.Na[a]
-    return q
+
+    # ROOT chance-constraint accumulation: at the root (node_depth == 0), `a` is the
+    # root action this rollout committed to and `leaf_pc` is the Pc-at-TCA of the
+    # leaf it reached. Tally one rollout, whether that leaf violated δ, and the leaf
+    # Pc — the raw material for p_viol(a) and E[Pc](a) at the root decision. The `q`
+    # math above is untouched; this is pure instrumentation.
+    if node_depth == 0
+        node.roll_a[a]  = get(node.roll_a, a, 0) + 1
+        node.pcsum_a[a] = get(node.pcsum_a, a, 0.0) + leaf_pc
+        if leaf_pc > pomdp.pc_threshold
+            node.viol_a[a] = get(node.viol_a, a, 0) + 1
+        end
+    end
+
+    return q, leaf_pc
 end
 
 # =========================================================================
@@ -1487,6 +1563,13 @@ struct MCTSPlanner
     # non-arrival the debris is predict-only that step. 1.0 = the original
     # guaranteed-measurement behavior (Bernoulli draw skipped, byte-identical).
     p_arrival::Float64
+    # ROOT chance-constraint knobs (2026-08-11). `α` = risk level of the root
+    # chance constraint (Blackmore/Ono); `root_rule` = :chance (mask on p_viol,
+    # rank feasible by Qa, least-infeasible fallback) | :legacy (plain argmax-Q,
+    # the soft-penalty planner, for reproducing older results). The IN-TREE search
+    # is identical under both — these govern ONLY the committed root action.
+    α_cc::Float64
+    root_rule::Symbol
     grid::Union{DecisionGrid,Nothing}
 end
 
@@ -1508,6 +1591,8 @@ function MCTSPlanner(pomdp::SpacecraftCAPOMDP;
                      reward_mode::Symbol = MCTS_REWARD_MODE,
                      terminal_penalty::Real = MCTS_TERMINAL_PENALTY,
                      p_arrival::Real = 1.0,
+                     α_cc::Real = MCTS_ALPHA,
+                     root_rule::Symbol = MCTS_ROOT_RULE,
                      grid::Union{DecisionGrid,Nothing} = nothing)
     # On the adaptive grid the max usable depth is the number of grid steps (a
     # rollout reaches TCA there); cap max_depth to it so the depth budget never
@@ -1519,7 +1604,7 @@ function MCTSPlanner(pomdp::SpacecraftCAPOMDP;
                        constraint_mode, Float64(pc_weight), Float64(pc_penalty),
                        sigma_mode, parallel, n_workers,
                        reward_mode, Float64(terminal_penalty),
-                       Float64(p_arrival), grid)
+                       Float64(p_arrival), Float64(α_cc), root_rule, grid)
 end
 
 """
@@ -1592,6 +1677,122 @@ function best_action_by_q(actions::AbstractVector{CAAction}, Qa::AbstractDict)
     return best_a
 end
 
+# =========================================================================
+# ROOT CHANCE CONSTRAINT (2026-08-11) — feasibility gate on p_viol, ranked by Qa.
+# See notes/chance_constraint_design_decision.md + the MCTS_ALPHA / MCTS_ROOT_RULE
+# constant comments. This REPLACES the plain argmax-Q at the root under :chance;
+# :legacy keeps argmax-Q (the soft-penalty planner) for reproducing older results.
+# =========================================================================
+
+"""
+    root_action_stats(root) -> Dict{CAAction,NamedTuple}
+
+Per-root-action chance-constraint statistics gathered over the plan's rollouts,
+one entry per action that was tried at the root:
+    (n = rollouts through a, p_viol = P̂[Pc(TCA) > δ | a], epc = E[Pc | a])
+where `p_viol` is the fraction of a's rollouts whose LEAF Pc-at-TCA exceeded δ and
+`epc` is the mean leaf Pc over a's rollouts (both from the root's `roll_a` /
+`viol_a` / `pcsum_a` accumulators). Actions with zero rollouts are omitted. This
+is the raw material for `chance_constrained_action` and for the per-decision
+logging the executor emits.
+"""
+function root_action_stats(root::BeliefNode)
+    stats = Dict{CAAction,NamedTuple{(:n, :p_viol, :epc),Tuple{Int,Float64,Float64}}}()
+    for (a, n) in root.roll_a
+        n == 0 && continue
+        p_viol = get(root.viol_a, a, 0) / n
+        epc    = get(root.pcsum_a, a, 0.0) / n
+        stats[a] = (n = n, p_viol = p_viol, epc = epc)
+    end
+    return stats
+end
+
+"""
+    chance_constrained_action(pomdp, actions, Qa, stats; α=MCTS_ALPHA,
+                              pc_weight=MCTS_PC_REWARD_WEIGHT,
+                              rule=MCTS_ROOT_RULE) -> best_action
+
+The ROOT decision under the chance-constraint rule. `stats` is the
+`root_action_stats` dict; `Qa` the per-action mean return (used ONLY for `:legacy`).
+
+  rule == :legacy → plain `best_action_by_q(actions, Qa)`: the pre-2026-08-11
+      soft-penalty behavior (argmax Qa over ALL actions, WITH the in-tree 1e4
+      terminal penalty). Returns IMMEDIATELY — none of the chance-constraint logic
+      below runs. Reproduces older results faithfully.
+
+  rule == :chance (default) — ONLY this path runs the mask + expectation ranking:
+    feasible = { a : p_viol(a) < α }   (an action with NO rollout stats is treated
+        as feasible with p_viol = 0 — never observed to violate; only arises if an
+        action was never expanded.)
+    • feasible nonempty → argmax over FEASIBLE actions of the CLEAN value
+        clean(a) = −pc_weight·E[Pc](a) − maneuver_cost·1[a is a burn].
+      The EXPECTATION objective (Grace, 2026-08-11): rank feasible actions by mean
+      leaf Pc traded off against fuel — NOT by Qa. Qa carries the in-tree 1e4
+      terminal penalty, and at n_iter=100 a lone violating rollout injects −1e4/n
+      into WAIT's mean Qa and wrongly flips a SAFE defer to a burn (observed on
+      38771 best-quality: WAIT p_viol=0.037<α but Qa ranked it below MANEUVER).
+      Ranking on E[Pc]+fuel removes that — the 1e4 stays IN-TREE for UCB but never
+      enters the committed decision. The fuel term puts the fuel-vs-Pc indifference
+      point exactly at δ (pc_weight·δ = 1e6·1e-5 = 10 = maneuver_cost): a burn is
+      worth it among feasible actions only once E[Pc] reaches the collision
+      threshold, so two SAFE actions resolve toward the cheaper (no-burn) one →
+      best-quality DEFERS.
+    • feasible empty (genuinely unavoidable) → least-infeasible = argmin_a E[Pc](a)
+      ("if you can't be safe, be least dangerous on average"). Fuel is irrelevant
+      when already over δ, so the fallback ranks on E[Pc] alone.
+
+`α = Inf` makes every action feasible; the E[Pc]+fuel ranking then governs (this is
+NOT argmax-Qa — use rule == :legacy for the old behavior).
+"""
+function chance_constrained_action(pomdp::SpacecraftCAPOMDP,
+                                   actions::AbstractVector{CAAction},
+                                   Qa::AbstractDict, stats::AbstractDict;
+                                   α::Real = MCTS_ALPHA,
+                                   pc_weight::Real = MCTS_PC_REWARD_WEIGHT,
+                                   rule::Symbol = MCTS_ROOT_RULE)
+    # LEGACY (soft-penalty) path: pure argmax-Qa, WITH the 1e4 term. Returns here —
+    # none of the chance-constraint logic below is reached under :legacy.
+    if rule == :legacy
+        return best_action_by_q(actions, Qa)
+    end
+
+    # ---- rule == :chance only, from here down --------------------------------
+    # p_viol(a): an action with no observed rollouts has no violation evidence → 0.
+    p_viol(a) = haskey(stats, a) ? stats[a].p_viol : 0.0
+    # E[Pc](a): no stats ⇒ +Inf (an unmeasured action is not preferred on Pc).
+    epc(a) = haskey(stats, a) ? stats[a].epc : Inf
+    feasible = CAAction[a for a in actions if p_viol(a) < α]
+
+    if !isempty(feasible)
+        # argmax over the feasible set of the CLEAN value: −pc_weight·E[Pc] minus the
+        # burn's fuel cost. Expectation objective + fuel; Qa / the 1e4 term excluded.
+        clean(a) = -pc_weight * epc(a) -
+                   (a == MANEUVER ? Float64(pomdp.maneuver_cost) : 0.0)
+        best_a = feasible[1]
+        best_v = -Inf
+        for a in feasible
+            v = clean(a)
+            if v > best_v
+                best_v = v
+                best_a = a
+            end
+        end
+        return best_a
+    end
+
+    # No feasible action: least-infeasible by mean leaf Pc (fuel irrelevant over δ).
+    best_a = actions[1]
+    best_epc = Inf
+    for a in actions
+        e = epc(a)
+        if e < best_epc
+            best_epc = e
+            best_a = a
+        end
+    end
+    return best_a
+end
+
 """
     plan(planner, root::BeliefNode, rng) -> (best_action, root)
 
@@ -1608,7 +1809,11 @@ function plan(planner::MCTSPlanner, root::BeliefNode, rng::AbstractRNG)
         return plan_parallel(planner, root, rng)
     end
     run_sims!(planner, root, rng)
-    return best_action_by_q(POMDPs.actions(planner.pomdp), root.Qa), root
+    stats = root_action_stats(root)
+    a = chance_constrained_action(planner.pomdp, POMDPs.actions(planner.pomdp),
+                                  root.Qa, stats; α = planner.α_cc,
+                                  pc_weight = planner.pc_weight, rule = planner.root_rule)
+    return a, root
 end
 
 # =========================================================================
@@ -1697,7 +1902,8 @@ order-independent and reproducible. Actions with zero total visits are omitted
 function merge_action_stats(stats::AbstractVector)
     Na_total = Dict{CAAction,Int}()
     num      = Dict{CAAction,Float64}()   # Σ Na·Q accumulator per action
-    for (Na, Qa) in stats
+    for chunk in stats
+        Na, Qa = chunk[1], chunk[2]       # chunk may carry extra (accumulator) fields
         for (a, na) in Na
             na == 0 && continue
             Na_total[a] = get(Na_total, a, 0) + na
@@ -1712,21 +1918,59 @@ function merge_action_stats(stats::AbstractVector)
 end
 
 """
-    _run_chunk(planner, root, n_iter, seed, table) -> (Na, Qa)
+    merge_root_accumulators(stats) -> (roll_a, viol_a, pcsum_a)
+
+Merge the per-chunk root chance-constraint accumulators (the 3rd–5th elements of
+each `_run_chunk` return) into single dicts. Unlike Qa (an Na-WEIGHTED average),
+these are plain rollout/violation COUNTS and leaf-Pc SUMS, so merging across the
+independent per-worker trees is a straight element-wise SUM — the combined
+p_viol(a) = Σviol / Σroll and E[Pc](a) = Σpcsum / Σroll are exactly what a single
+serial run of the combined budget would have tallied. Order-independent.
+"""
+function merge_root_accumulators(stats::AbstractVector)
+    roll_a  = Dict{CAAction,Int}()
+    viol_a  = Dict{CAAction,Int}()
+    pcsum_a = Dict{CAAction,Float64}()
+    for chunk in stats
+        length(chunk) < 5 && continue     # legacy 2-tuple (no accumulators) — skip
+        cr, cv, cp = chunk[3], chunk[4], chunk[5]
+        for (a, n) in cr
+            roll_a[a] = get(roll_a, a, 0) + n
+        end
+        for (a, n) in cv
+            viol_a[a] = get(viol_a, a, 0) + n
+        end
+        for (a, s) in cp
+            pcsum_a[a] = get(pcsum_a, a, 0.0) + s
+        end
+    end
+    return roll_a, viol_a, pcsum_a
+end
+
+"""
+    _run_chunk(planner, root, n_iter, seed, table)
+        -> (Na, Qa, roll_a, viol_a, pcsum_a)
 
 Run one worker's share of the budget: `deepcopy` the root (so the worker mutates
 its OWN independent tree — critical when this runs on a remote process, and
 harmless locally), seed a fresh `MersenneTwister(seed)`, run `n_iter` sims via the
-shared `run_sims!` kernel, and return only the root's per-action `(Na, Qa)` (the
-merge needs nothing else, and small dicts serialize cheaply back to the
-coordinator). The `table` is built once on the coordinator and passed in.
+shared `run_sims!` kernel, and return the root's per-action decision statistics:
+the `(Na, Qa)` for the argmax-Q rank and the chance-constraint accumulators
+`(roll_a, viol_a, pcsum_a)` for the p_viol / E[Pc] merge. All small dicts,
+serialize cheaply back to the coordinator. The `table` is built once on the
+coordinator and passed in.
 """
 function _run_chunk(planner::MCTSPlanner, root::BeliefNode, n_iter::Int,
                     seed::UInt, table::Union{SigmaTCATable,Nothing})
     local_root = deepcopy(root)
     rng = MersenneTwister(seed)
     run_sims!(planner, local_root, rng; n_iterations = n_iter, table = table)
-    return (copy(local_root.Na), copy(local_root.Qa))
+    # Return the root's per-action decision stats: the Qa/Na for the argmax-Q rank
+    # AND the chance-constraint accumulators (rollout / violation counts + leaf-Pc
+    # sums) so the coordinator can merge p_viol(a) and E[Pc](a) across chunks.
+    return (copy(local_root.Na), copy(local_root.Qa),
+            copy(local_root.roll_a), copy(local_root.viol_a),
+            copy(local_root.pcsum_a))
 end
 
 """
@@ -1796,6 +2040,7 @@ function plan_parallel(planner::MCTSPlanner, root::BeliefNode, rng::AbstractRNG)
     end
 
     Na_total, Qa_merged = merge_action_stats(stats)
+    roll_m, viol_m, pcsum_m = merge_root_accumulators(stats)
     # Write the merged decision statistics back onto the passed root so callers /
     # tests can inspect them exactly as with a serial plan. (The per-node tree
     # itself lives on the worker copies and is intentionally not merged — root
@@ -1803,7 +2048,14 @@ function plan_parallel(planner::MCTSPlanner, root::BeliefNode, rng::AbstractRNG)
     root.Na = Na_total
     root.Qa = Qa_merged
     root.N  = sum(values(Na_total); init = 0)
-    return best_action_by_q(POMDPs.actions(planner.pomdp), Qa_merged), root
+    root.roll_a  = roll_m
+    root.viol_a  = viol_m
+    root.pcsum_a = pcsum_m
+    root_stats = root_action_stats(root)
+    a = chance_constrained_action(planner.pomdp, POMDPs.actions(planner.pomdp),
+                                  Qa_merged, root_stats; α = planner.α_cc,
+                                  pc_weight = planner.pc_weight, rule = planner.root_rule)
+    return a, root
 end
 
 """

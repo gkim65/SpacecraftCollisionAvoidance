@@ -1,0 +1,71 @@
+# =============================================================================
+# sweep_mcts_legacy.yaml — MCTS under the LEGACY soft-penalty root rule (argmax-Qa).
+#
+# The PAIRED regression/baseline twin of sweep_mcts_chance.yaml: IDENTICAL axes +
+# seeds (cadence {2,4,8,24} × 8 cases × 3 quality × 5 seeds = 480 episodes,
+# p_arrival = 1.0), but the ROOT decision uses the pre-2026-08-11 soft-penalty rule
+# (root_rule = legacy): plain argmax over the per-action mean return Qa, WITH the
+# in-tree 1e4 terminal penalty. This reproduces the OLD planner's decisions.
+#
+# WHY: every legacy cell is the twin of a chance cell at the SAME
+# (case, quality, seed, cadence), so the old-vs-new decision difference is
+# attributable to the RULE alone — not sampling noise. On 38771 best-quality the
+# legacy rule panic-burns at step 1 (the 1e4-in-Qa knife-edge) where chance
+# correctly defers. Run the two side by side; separate fresh projects.
+#
+# n_iterations = 100 to MATCH the chance sweep exactly (a fair paired comparison —
+# the rollout budget must be identical). 12 h per-episode timeout; the 2 h-cadence
+# cells are the slow tail.
+# =============================================================================
+
+program: scripts/wandb_runner.py
+method: grid
+project: spacecraftCA-mcts-legacy      # FRESH project — legacy (soft-penalty) twin
+entity: kmeans_gsopt
+
+command:
+  - uv
+  - run
+  - python
+  - ${program}
+  - --timeout-s          # per-episode Julia timeout: 12 h (match the chance sweep).
+  - "43200"
+
+parameters:
+  cadence_h:
+    values: [2, 4, 8, 24]
+  case_path:
+    values:
+      - data/cara_cdms/000040059_conj_000035921_20220326_194122_20220325_215435.cdm
+      - data/cara_cdms/000040115_conj_000030660_20230721_100115_20230720_061903.cdm
+      - data/cara_cdms/000025994_conj_000026132_20220224_100307_20220221_225515.cdm
+      - data/cara_cdms/000038771_conj_000030802_20201216_182131_20201215_171306.cdm
+      - data/cara_cdms/000029108_conj_000034995_20220706_165058_20220705_143113.cdm
+      - data/cara_cdms/000037849_conj_000013512_20210612_084905_20210611_062043.cdm
+      - data/cara_cdms/000033591_conj_000042216_20211203_183431_20211202_153618.cdm
+      - data/cara_cdms/000028654_conj_000041835_20220106_193032_20220105_161142.cdm
+  sensor_quality:
+    values: [best, median, worst]
+  seed:
+    values: [1, 2, 3, 4, 5]
+  policy_variant:
+    values: [mcts]
+
+  # ---- fixed knobs ----
+  p_arrival:
+    value: 1.0
+  sigma_mode:
+    value: exact
+  reward_mode:
+    value: terminal
+  constraint_mode:
+    value: penalize
+  grid_mode:
+    value: measurement
+  # LEGACY soft-penalty root rule (argmax-Qa, WITH the 1e4 terminal penalty).
+  root_rule:
+    value: legacy
+  alpha_cc:
+    value: 0.05                        # ignored under legacy (no feasibility gate)
+  n_iterations:
+    value: 100                         # MATCH the chance sweep (fair paired budget)
