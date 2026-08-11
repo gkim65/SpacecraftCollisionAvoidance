@@ -28,8 +28,8 @@ command:
   - run
   - python
   - ${program}
-  - --timeout-s          # per-episode Julia timeout: 12 h (match the chance sweep).
-  - "43200"
+  - --timeout-s          # per-episode Julia timeout: 48 h (match the chance sweep;
+  - "172800"             # generous headroom for the slow 2 h-cadence n_iter=100 cells).
 
 parameters:
   cadence_h:

@@ -34,8 +34,8 @@ command:
   - run
   - python
   - ${program}
-  - --timeout-s          # per-episode Julia timeout: 12 h. n_iter=100 is ~8×
-  - "43200"              # heavier than n_iter=12; the 2 h-cadence cells are slow.
+  - --timeout-s          # per-episode Julia timeout: 48 h (generous headroom so a slow
+  - "172800"             # 2 h-cadence n_iter=100 cell is never killed mid-episode).
 
 parameters:
   cadence_h:

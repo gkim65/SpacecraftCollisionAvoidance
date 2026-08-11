@@ -184,6 +184,12 @@ def _build_cfg_from_args(args):
     cfg["grid_mode"] = args.grid_mode
     if getattr(args, "p_arrival", None) is not None:
         cfg["p_arrival"] = float(args.p_arrival)
+    # ROOT chance-constraint knobs. The SWEEP path injects these from wandb.config
+    # (the YAML axis) with no code change; these are for the single-run / sanity path.
+    if getattr(args, "root_rule", None) is not None:
+        cfg["root_rule"] = args.root_rule
+    if getattr(args, "alpha_cc", None) is not None:
+        cfg["alpha_cc"] = float(args.alpha_cc)
     # DECISION POLICY (F3): a single flat variant string ("mcts" / "wait_feasibility" /
     # "delay_<N>h"). run_episode_entry.jl maps it to (policy, policy_params). Default
     # "mcts" keeps the pre-baseline behavior. (A sweep passes this via wandb.config;
@@ -201,6 +207,11 @@ def main():
                     choices=["best", "median", "worst"])
     ap.add_argument("--cadence-h", dest="cadence_h", type=float,
                     help="secondary measurement cadence in HOURS (e.g. 2,4,8,24)")
+    ap.add_argument("--root-rule", dest="root_rule", default=None,
+                    help="root decision rule: 'chance' (true chance constraint) or "
+                         "'legacy' (soft-penalty argmax-Qa). Sweep sets it via the YAML.")
+    ap.add_argument("--alpha-cc", dest="alpha_cc", type=float, default=None,
+                    help="root chance-constraint risk level alpha (default 0.05).")
     ap.add_argument("--p-arrival", dest="p_arrival", type=float,
                     help="P(a scheduled DEBRIS measurement arrives); 1.0 (default) = "
                          "guaranteed, byte-identical to pre-arrival runs. <1 makes each "
