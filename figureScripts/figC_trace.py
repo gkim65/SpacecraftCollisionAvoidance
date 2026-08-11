@@ -33,8 +33,13 @@ OUT = os.path.normpath(os.path.join(HERE, "..", "figures"))
 DELTA = 1e-5
 
 # color = sensor quality (colour-blind-safe-ish, distinct on white/black)
-QCOLOR = {"best": "#1b7837", "median": "#2166ac", "worst": "#b2182b"}
+# Okabe-Ito colorblind-safe palette: green / blue / vermillion are mutually
+# distinguishable under all common CVD types.
+QCOLOR = {"best": "#009E73", "median": "#0072B2", "worst": "#D55E00"}
 QLABEL = {"best": "Best sensors", "median": "Median sensors", "worst": "Worst sensors"}
+# chance-constraint threshold: Okabe-Ito purple -- distinct from all three quality
+# colors (and colorblind-safe against them), so the reference line never reads as data.
+THR_COLOR = "#CC79A7"
 
 # Pc axis: real Pc spans ~1e-3 down to ~1e-16 when waiting works; a BURN drives Pc to
 # exactly 0. Plot 0 (and anything below ZERO_AT) on a dedicated "= 0 (safe)" band at the
@@ -95,8 +100,9 @@ def panel(ax, runs, title, fg):
     edge = fg                              # marker edge / X edge = theme foreground
     band = "#1c1c1c" if fg == "white" else "0.94"      # "= 0 (safe)" band
     grid = "0.28" if fg == "white" else "0.9"
-    ax.axhline(DELTA, color="#e8483a" if fg == "white" else "#d7301f", lw=1.6, ls="--",
-               zorder=2)
+    # dash-DOT + a distinct (purple) color so the threshold reads as clearly DIFFERENT
+    # from the counterfactual "if it had waited" dashed line (plain dash, ls=(0,(4,2))).
+    ax.axhline(DELTA, color=THR_COLOR, lw=1.9, ls=(0, (6, 2, 1, 2)), zorder=2)
     QMARK = {"best": "o", "median": "s", "worst": "^"}
     for run in runs:
         d = load(run)
@@ -154,7 +160,6 @@ IDS = {"40059": "000040059_conj_000035921", "28654": "000028654_conj_000041835",
 
 def build(dark):
     fg = "white" if dark else "black"
-    thr = "#e8483a" if dark else "#d7301f"
     fig, axes = plt.subplots(1, 3, figsize=(14, 4.8), sharey=True)
     for ax, tag in zip(axes, ["40059", "28654", "38771"]):
         runs, sub = P[tag]   # `sub` = intended message, NOT drawn (goes in the caption)
@@ -163,10 +168,13 @@ def build(dark):
     axes[0].set_ylabel(r"Collision probability $P_c$ at TCA")
     for ax in axes:
         ax.set_xlabel("Time to TCA (h)")
-        ax.text(ax.get_xlim()[0], ZERO_AT, r"$=0$ (safe)", fontsize=8,
-                color="0.7" if dark else "0.4", va="center", ha="left")
-    axes[0].text(axes[0].get_xlim()[0], DELTA * 3.0, r"chance constraint $10^{-5}$",
-                 color=thr, fontsize=9, va="bottom", ha="left")
+        # (no "=0 (safe)" text -- the gray floor band + legend already convey it)
+    # threshold label on the MIDDLE panel (28654), RIGHT side, BELOW the dash-dot line
+    # (x-axis is inverted, so the right side is the SMALLER time value = x1). Inset a bit
+    # from the edge so it doesn't overlap the axis frame.
+    x0, x1 = axes[1].get_xlim()
+    axes[1].text(x1 + 0.03 * (x0 - x1), DELTA * 0.30, r"chance constraint $10^{-5}$",
+                 color=THR_COLOR, fontsize=11, va="top", ha="right")
 
     _qm = {"best": "o", "median": "s", "worst": "^"}
     qhandles = [Line2D([0], [0], color=QCOLOR[q], lw=2.6, marker=_qm[q], ms=7,
@@ -176,6 +184,8 @@ def build(dark):
         Line2D([0], [0], color=ng, lw=2.8, label="Solid: what MCTS actually did"),
         Line2D([0], [0], color=ng, lw=1.4, ls=(0, (4, 2)), alpha=0.7,
                label="Dashed: $P_c$ if it had waited instead"),
+        Line2D([0], [0], color=THR_COLOR, lw=1.9, ls=(0, (6, 2, 1, 2)),
+               label=r"Chance constraint ($P_c = 10^{-5}$)"),
         Line2D([0], [0], marker="o", color="none", markerfacecolor="none",
                markeredgecolor=ng, markeredgewidth=2, ms=11,
                label="MCTS defers (never maneuvers)"),
@@ -183,17 +193,18 @@ def build(dark):
                markeredgecolor=fg, ms=12, label=r"MCTS maneuvers ($P_c \to 0$)"),
     ]
     leg1 = fig.legend(handles=qhandles, loc="lower center", ncol=3, frameon=False,
-                      fontsize=10, bbox_to_anchor=(0.5, 0.10),
+                      fontsize=13, bbox_to_anchor=(0.5, 0.10),
                       title="Line colour = sensor quality")
     leg1.get_title().set_color(fg)
+    leg1.get_title().set_fontsize(13)
     for t in leg1.get_texts():
         t.set_color(fg)
     fig.add_artist(leg1)
-    leg2 = fig.legend(handles=style, loc="lower center", ncol=4, frameon=False, fontsize=9,
-                      bbox_to_anchor=(0.5, 0.005))
+    leg2 = fig.legend(handles=style, loc="lower center", ncol=5, frameon=False,
+                      fontsize=11, bbox_to_anchor=(0.5, 0.005))
     for t in leg2.get_texts():
         t.set_color(fg)
-    fig.tight_layout(rect=(0, 0.20, 1, 0.99))
+    fig.tight_layout(rect=(0, 0.24, 1, 0.99))   # extra bottom room for the larger legends
     save(fig, os.path.join(OUT, f"figC_trace_{'dark' if dark else 'light'}"), dark)
     plt.close(fig)
 
