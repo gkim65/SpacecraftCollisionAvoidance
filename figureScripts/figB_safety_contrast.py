@@ -51,7 +51,8 @@ OUT = os.path.normpath(os.path.join(HERE, "..", "figures"))
 
 DELTA = 1e-5                                    # chance-constraint threshold
 QUALITIES = ["best", "median", "worst"]         # one PANEL per quality (degrading L->R)
-QTITLE = {"best": "Best tracking", "median": "Median tracking", "worst": "Worst tracking"}
+QTITLE = {"best": "Sensor tracking: Best", "median": "Sensor tracking: Median",
+          "worst": "Sensor tracking: Worst"}
 GATES = ["delay_28h", "delay_12h", "delay_6h", "delay_3h"]   # frontier, ordered by wait
 GLABEL = {"delay_28h": "28 h", "delay_12h": "12 h", "delay_6h": "6 h", "delay_3h": "3 h"}
 MCTS = "mcts"
@@ -122,8 +123,9 @@ def make_fig(S, dark):
     tex = plt.rcParams.get("text.usetex")
     pct = r"\%" if tex else "%"
 
-    fig, axes = plt.subplots(1, 3, figsize=(11.0, 4.4), sharex=True, sharey=True)
-    fig.subplots_adjust(left=0.085, right=0.985, top=0.80, bottom=0.155, wspace=0.10)
+    fig, axes = plt.subplots(1, 3, figsize=(11.0, 4.6), sharex=True, sharey=True)
+    # no top suptitle now; leave room at the BOTTOM for the horizontal legend.
+    fig.subplots_adjust(left=0.085, right=0.985, top=0.92, bottom=0.255, wspace=0.10)
 
     # global y ceiling with headroom
     vmax = max(s["vrate"] for s in S.values() if np.isfinite(s["vrate"]))
@@ -179,15 +181,11 @@ def make_fig(S, dark):
                markeredgecolor=plan_c, markeredgewidth=2.0, markersize=9,
                label="Perfect-obs offline plan"),
     ]
-    leg = fig.legend(handles=handles, loc="upper center", ncol=3, frameon=True,
-                     framealpha=0.85, edgecolor=fg, bbox_to_anchor=(0.5, 0.985))
+    leg = fig.legend(handles=handles, loc="lower center", ncol=3, frameon=True,
+                     framealpha=0.85, edgecolor=fg, bbox_to_anchor=(0.5, 0.005))
     for t in leg.get_texts():
         t.set_color(fg)
     leg.get_frame().set_facecolor("black" if dark else "white")
-
-    fig.suptitle("Operator-facing residual risk: fixed clocks leave it on the table, "
-                 "the belief planner drives it to zero",
-                 color=fg, fontsize=12.5, y=0.905)
 
     save(fig, os.path.join(OUT, f"figB_safety_contrast_{'dark' if dark else 'light'}"), dark)
 
