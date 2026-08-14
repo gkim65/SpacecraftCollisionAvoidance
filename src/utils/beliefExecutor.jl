@@ -338,6 +338,12 @@ function episode_config(; case_path::AbstractString,
                         n_iterations::Integer = 12,
                         reward_mode::Symbol = :terminal,
                         constraint_mode::Symbol = :penalize,
+                        # Skip the to-TCA Pc propagation at INTERNAL tree nodes
+                        # (:terminal mode only; see MCTS_LEAF_ONLY_PC). Behavior-
+                        # neutral ~1.7-2x speedup. Default false so the figure probes
+                        # that read per-node .pc / .violated keep working; sweeps
+                        # opt in via the YAML so the choice is logged to wandb.
+                        leaf_only_pc::Bool = MCTS_LEAF_ONLY_PC,
                         k::Real = 2.0,
                         truncate_safe::Bool = false,
                         sec_class_override::Union{Symbol,Nothing} = nothing,
@@ -364,6 +370,7 @@ function episode_config(; case_path::AbstractString,
         "n_iterations"      => Int(n_iterations),
         "reward_mode"       => String(reward_mode),
         "constraint_mode"   => String(constraint_mode),
+        "leaf_only_pc"      => leaf_only_pc,
         "k"                 => Float64(k),
         "truncate_safe"     => truncate_safe,
         "sec_class_override" => sec_class_override === nothing ? nothing : String(sec_class_override),
@@ -438,6 +445,7 @@ function run_episode_metrics(cfg::AbstractDict)
         n_iterations   = Int(_cfg(cfg, "n_iterations", 12))
         reward_mode    = _sym(_cfg(cfg, "reward_mode", :terminal))
         constraint_mode = _sym(_cfg(cfg, "constraint_mode", :penalize))
+        leaf_only_pc   = Bool(_cfg(cfg, "leaf_only_pc", MCTS_LEAF_ONLY_PC))
         k              = Float64(_cfg(cfg, "k", 2.0))
         coarse         = Float64(_cfg(cfg, "coarse", 8 * 3600))
         truncate_safe  = Bool(_cfg(cfg, "truncate_safe", false))
@@ -500,6 +508,7 @@ function run_episode_metrics(cfg::AbstractDict)
                               parallel = parallel, reward_mode = reward_mode,
                               constraint_mode = constraint_mode, p_arrival = p_arrival,
                               α_cc = α_cc, root_rule = root_rule,
+                              leaf_only_pc = leaf_only_pc,
                               grid = root_grid)
         # `verbose=true` (config key) streams a per-step @info line AS EACH STEP
         # EXECUTES (run_episode's own live trace) — intermediate progress for long

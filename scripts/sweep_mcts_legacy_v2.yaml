@@ -1,4 +1,32 @@
 # =============================================================================
+# v2 RERUN (2026-08-14) — FRESH PROJECT, one clean code version end to end.
+#
+# Identical experimental design to sweep_mcts_{chance,legacy}.yaml; the ONLY changes
+# are the `project` (fresh, so v2 data never mixes with the partial earlier runs) and
+# `leaf_only_pc: true`.
+#
+# WHY A RERUN: the earlier projects (spacecraftCA-mcts-{chance,legacy}) are partial and
+# mixed-provenance — 375/480 and 356/480 unique cells finished, the 2 h cadence is the
+# hole (30/120 and 46/120), and legacy has 40 crashed runs. Rather than backfill across
+# two code versions, rerun everything on one.
+#
+# leaf_only_pc = true: skips the to-TCA Pc propagation at INTERNAL tree nodes (valid in
+# :terminal reward mode, where the per-step reward is fuel-only and only the LEAF's Pc
+# feeds p_viol / E[Pc]). Verified bit-identical action, per-action n / p_viol / E[Pc],
+# and Qa to all digits on the 38771 defer case AT the alpha knife-edge (p_viol=0.0370
+# vs alpha=0.05). ~1.7-2x faster; a 2 h-cadence 13-step episode runs in ~22 min.
+# NOTE: it blanks the per-NODE .pc/.violated tree instrumentation, which only the local
+# figure probes read (treezoom_probe.jl, phase6_tree_data.jl, phase6_ablation_data.jl).
+# Every wandb metric is computed by the executor itself and is UNAFFECTED. If you ever
+# want a tree dump from a sweep cell for a figure, rerun that one cell with false.
+#
+# LAUNCH: single-threaded per agent, else each agent spawns one BLAS thread per core
+# (50 agents x 56 cores = ~2800 threads competing). Export before `wandb agent`:
+#   OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 JULIA_NUM_THREADS=1 MKL_NUM_THREADS=1
+# Memory measured at ~1.3 GB peak per agent (2 h cadence, n_iter=100), so 50 agents
+# is ~64 GB of a 126 GB node.
+# =============================================================================
+# =============================================================================
 # sweep_mcts_legacy.yaml — MCTS under the LEGACY soft-penalty root rule (argmax-Qa).
 #
 # The PAIRED regression/baseline twin of sweep_mcts_chance.yaml: IDENTICAL axes +
@@ -20,7 +48,7 @@
 
 program: scripts/wandb_runner.py
 method: grid
-project: spacecraftCA-mcts-legacy      # FRESH project — legacy (soft-penalty) twin
+project: spacecraftCA-mcts-legacy-v2      # v2 RERUN — fresh project
 entity: kmeans_gsopt
 
 command:

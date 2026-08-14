@@ -77,6 +77,7 @@ function main()
         n_iterations      = Int(getk("n_iterations", 12)),
         reward_mode       = Symbol(getk("reward_mode", "terminal")),
         constraint_mode   = Symbol(getk("constraint_mode", "penalize")),
+        leaf_only_pc      = Bool(getk("leaf_only_pc", MCTS_LEAF_ONLY_PC)),
         k                 = Float64(getk("k", 2.0)),
         truncate_safe     = Bool(getk("truncate_safe", false)),
         dt                = Float64(getk("dt", 60 * 60)),

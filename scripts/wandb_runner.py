@@ -182,6 +182,8 @@ def _build_cfg_from_args(args):
     cfg["reward_mode"] = args.reward_mode
     cfg["constraint_mode"] = args.constraint_mode
     cfg["grid_mode"] = args.grid_mode
+    if getattr(args, "leaf_only_pc", None) is not None:
+        cfg["leaf_only_pc"] = bool(args.leaf_only_pc)
     if getattr(args, "p_arrival", None) is not None:
         cfg["p_arrival"] = float(args.p_arrival)
     # ROOT chance-constraint knobs. The SWEEP path injects these from wandb.config
@@ -225,6 +227,11 @@ def main():
     ap.add_argument("--sigma-mode", dest="sigma_mode", default="exact")
     ap.add_argument("--reward-mode", dest="reward_mode", default="terminal")
     ap.add_argument("--constraint-mode", dest="constraint_mode", default="penalize")
+    # Skip the to-TCA Pc propagation at INTERNAL tree nodes (:terminal reward only) --
+    # behavior-neutral ~1.7-2x speedup. The SWEEP path takes this from the YAML via
+    # wandb.config; this flag is for the single-run / sanity check path.
+    ap.add_argument("--leaf-only-pc", dest="leaf_only_pc",
+                    action="store_true", default=None)
     ap.add_argument("--grid-mode", dest="grid_mode", default="measurement",
                     choices=["measurement", "adaptive"])
     ap.add_argument("--project", default=os.environ.get("WANDB_PROJECT", DEFAULT_PROJECT))

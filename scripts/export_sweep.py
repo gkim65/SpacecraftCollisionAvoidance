@@ -49,9 +49,17 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(REPO, "figureScripts", "data")
 
 PROJECTS = [
-    "kmeans_gsopt/spacecraftCA-mcts-clean",
+    "kmeans_gsopt/spacecraftCA-mcts-chance",   # root_rule=chance  -> mcts_chance
+    "kmeans_gsopt/spacecraftCA-mcts-legacy",   # root_rule=legacy  -> mcts_soft_penalty
+    "kmeans_gsopt/spacecraftCA-mcts-clean",    # superseded MCTS sweep -> mcts (legacy export)
     "kmeans_gsopt/spacecraftCA-belief-mcts",
 ]
+
+# The 2026-08-11 paired sweeps both log policy_variant="mcts"; the ROOT RULE is what
+# differs, so re-tag them at export time into two distinct analysis variants:
+#   mcts_chance        — true root chance constraint (the method)
+#   mcts_soft_penalty  — pre-2026-08-11 soft Pc-penalty argmax-Qa root rule (ablation)
+ROOT_RULE_VARIANT = {"chance": "mcts_chance", "legacy": "mcts_soft_penalty"}
 
 # The expected sweep grid (scripts/sweep.yaml): 8 debris cases x 3 quality x
 # 4 cadence x 5 seed x 6 policy_variant. Coverage is checked against this.
@@ -64,7 +72,7 @@ EXPECTED_CASES = [
 EXPECTED_QUALITY = ["best", "median", "worst"]
 EXPECTED_CADENCE = [24, 8, 4, 2]
 EXPECTED_SEEDS = [1, 2, 3, 4, 5]
-EXPECTED_VARIANTS = ["mcts", "wait_feasibility",
+EXPECTED_VARIANTS = ["mcts_chance", "mcts_soft_penalty", "mcts", "wait_feasibility",
                      "delay_28h", "delay_12h", "delay_6h", "delay_3h"]
 
 # Heavy keys that live in the per-run summary but are stripped OUT of the scalar
@@ -87,6 +95,7 @@ CSV_COLUMNS = [
     "miss_cdm_m", "relative_speed_mps", "pc_cdm", "valid_2d", "tca",
     # config
     "pc_threshold", "delta_v_mps", "reward_mode", "constraint_mode",
+    "root_rule", "alpha_cc",
     "sigma_mode", "n_iterations", "grid_mode", "grid_steps", "max_steps",
     # core metrics (the A-analysis inputs)
     "pc_at_tca", "peak_pc", "integrated_pc", "resolved_without_maneuver",
@@ -115,10 +124,23 @@ def case_id_from_path(p):
     return base
 
 
+def get_root_rule(config, summary):
+    cfg = summary.get("config") if isinstance(summary.get("config"), dict) else {}
+    rr = config.get("root_rule") or cfg.get("root_rule") or summary.get("root_rule")
+    return str(rr) if rr else None
+
+
 def get_variant(config, summary):
     v = config.get("policy_variant")
     if v:
-        return str(v)
+        v = str(v)
+        # MCTS runs split by ROOT RULE (chance vs legacy soft penalty); the two paired
+        # 2026-08-11 sweeps both log policy_variant="mcts".
+        if v == "mcts":
+            rr = get_root_rule(config, summary)
+            if rr in ROOT_RULE_VARIANT:
+                return ROOT_RULE_VARIANT[rr]
+        return v
     # fall back to the echoed config sub-dict / policy field
     cfg = summary.get("config") if isinstance(summary.get("config"), dict) else {}
     return str(config.get("policy") or cfg.get("policy") or "unknown")
@@ -169,6 +191,8 @@ def flatten_row(run_id, run_name, project, state, config, summary):
         "delta_v_mps": pick("delta_v_mps"),
         "reward_mode": pick("reward_mode"),
         "constraint_mode": pick("constraint_mode"),
+        "root_rule": get_root_rule(config, summary),
+        "alpha_cc": pick("alpha_cc"),
         "sigma_mode": pick("sigma_mode"),
         "n_iterations": pick("n_iterations"),
         "grid_mode": pick("grid_mode"),
