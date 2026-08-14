@@ -70,6 +70,20 @@ struct ExecStep
     # TCA); `pc` above is Pc-at-TCA from these grown to TCA.
     sigma_sc::Matrix{Float64}
     sigma_debris::Matrix{Float64}
+    # Per-root-action CHANCE-CONSTRAINT statistics for THIS step's decision — the
+    # mechanism of the constraint, which was previously computed and thrown away (it
+    # only ever reached stdout as an @info line, so no sweep could recover it).
+    # Maps action name => (n_rollouts, p_viol, epc). EMPTY for the gate/oracle
+    # baselines, which decide without running MCTS and so have no rollout statistics.
+    # p_viol = P̂[Pc(TCA) > δ | a] is what the α gate tests; an action is MASKED when
+    # p_viol ≥ α. Needed for FIG C1 (per-action p_viol vs the α line) and for post-hoc
+    # α-sensitivity (re-deciding offline at a different α without re-running).
+    action_stats::Dict{String,NamedTuple{(:n, :p_viol, :epc),Tuple{Int,Float64,Float64}}}
+    # Per-root-action mean return Qa (the in-tree MCTS value, WITH the 1e4 terminal
+    # penalty). The LEGACY root rule is argmax-Qa, so logging Qa alongside p_viol/E[Pc]
+    # makes BOTH rules' decisions reconstructible offline from one run: the chance rule
+    # from (p_viol vs α, then E[Pc]+fuel), legacy from argmax-Qa. Empty for the gates.
+    qa::Dict{String,Float64}
 end
 
 """
@@ -104,8 +118,34 @@ function mcts_policy(pomdp::SpacecraftCAPOMDP, root::BeliefNode, rng::AbstractRN
                      planner::MCTSPlanner, t_remaining::Real = root.belief.t,
                      grid = nothing, pc_threshold::Real = pomdp.pc_threshold,
                      delta_v::Real = pomdp.Δv, step::Int = 0, verbose::Bool = false,
+                     stats_ref::Union{Base.RefValue,Nothing} = nothing,
+                     qa_ref::Union{Base.RefValue,Nothing} = nothing,
+                     force_wait::Bool = false,
                      kwargs...)
     a, r = plan(planner, root, rng)
+    # Publish the per-action chance-constraint stats so `run_episode` can record them
+    # on the ExecStep (they used to reach stdout only). `stats_ref` is optional so the
+    # gate/oracle baselines — which never call the planner — need no changes.
+    if stats_ref !== nothing
+        stats_ref[] = Dict{String,NamedTuple{(:n,:p_viol,:epc),Tuple{Int,Float64,Float64}}}(
+            (act == MANEUVER ? "MANEUVER" : "WAIT") => s
+            for (act, s) in root_action_stats(r))
+    end
+    # Qa too — the LEGACY rule is argmax-Qa, so logging it makes both rules'
+    # decisions reconstructible offline from a single run.
+    if qa_ref !== nothing
+        qa_ref[] = Dict{String,Float64}(
+            (act == MANEUVER ? "MANEUVER" : "WAIT") => Float64(q) for (act, q) in r.Qa)
+    end
+    # FORCED-WAIT probe mode: run the planner (so p_viol / E[Pc] / Qa are recorded at
+    # every epoch) but always EXECUTE WAIT. This yields the one trajectory that is not
+    # conditioned on a past burn — the true deferral path — from which ANY α and EITHER
+    # root rule can be replayed offline: the first epoch where p_viol(WAIT) ≥ α is when
+    # the chance rule would have burned; the first where argmax Qa = MANEUVER is when
+    # legacy would have. ⚠️ Valid only UP TO that first divergence — after it, this
+    # trace is the wrong trajectory (the real episode would carry a maneuvered belief),
+    # so use it for DECISION TIMING, not for post-burn outcomes (final Pc, Δv).
+    force_wait && return WAIT
     if verbose
         # Per-decision chance-constraint trace: the ACTUAL per-root-action rollout
         # count, p_viol = P̂[Pc(TCA)>δ | a], and E[Pc|a] — so we can confirm ~n_iter/2
@@ -225,9 +265,14 @@ function run_episode(planner::MCTSPlanner, pomdp::SpacecraftCAPOMDP, s0::CAState
         #    passed so a timing gate can see the step's grid context if it wants.
         root = BeliefNode(belief, s_true, isterminal(pomdp, s_true);
                           since_sc = since_sc, since_debris = since_debris)
+        # `stats_ref` collects the per-action chance-constraint statistics for THIS
+        # step (mcts_policy fills it; the gate baselines ignore it and leave it empty).
+        stats_ref = Ref(Dict{String,NamedTuple{(:n,:p_viol,:epc),Tuple{Int,Float64,Float64}}}())
+        qa_ref    = Ref(Dict{String,Float64}())
         a = policy(pomdp, root, rng; planner = step_planner, t_remaining = t_remaining,
                    grid = exec_grid, pc_threshold = pomdp.pc_threshold,
-                   delta_v = pomdp.Δv, step = step, verbose = verbose)
+                   delta_v = pomdp.Δv, step = step, verbose = verbose,
+                   stats_ref = stats_ref, qa_ref = qa_ref)
 
         # 2. EXECUTE: advance the TRUE state. Fixed grid ⇒ pomdp.dt; adaptive grid
         #    ⇒ the grid's first epoch gap (the step the plan actually decided).
@@ -262,7 +307,8 @@ function run_episode(planner::MCTSPlanner, pomdp::SpacecraftCAPOMDP, s0::CAState
         # capture the FULL tracked belief Σ (6×6 ECI) for both objects at this step's
         # post-step belief — for the covariance trace (growth/shrink/drift diagnosis).
         push!(trace, ExecStep(step, t_remaining, a, Δv, pc, miss,
-                              Matrix{Float64}(belief.sc.Σ), Matrix{Float64}(belief.debris.Σ)))
+                              Matrix{Float64}(belief.sc.Σ), Matrix{Float64}(belief.debris.Σ),
+                              stats_ref[], qa_ref[]))
 
         if verbose
             @info "executed step" step=step t_h=round(t_remaining/3600, digits=2) action=a Δv=Δv pc=pc miss_km=round(miss/1000, digits=3)
@@ -552,11 +598,31 @@ end
 
 # Roll one finished episode (trace + scenario + feasibility spine) into the flat
 # JSON-serializable metrics dict. Split out so it is independently testable.
+# --- chance-constraint rollup helpers -----------------------------------------
+# All return `nothing` when no step carries rollout stats (the gate/oracle baselines
+# never run MCTS), so the summary field is null rather than a misleading 0.
+_pv_all(trace, act) = [s.action_stats[act].p_viol for s in trace if haskey(s.action_stats, act)]
+_pv_step1(trace, act) = isempty(trace) || !haskey(trace[1].action_stats, act) ?
+                        nothing : trace[1].action_stats[act].p_viol
+_nr_step1(trace, act) = isempty(trace) || !haskey(trace[1].action_stats, act) ?
+                        nothing : trace[1].action_stats[act].n
+function _pv_agg(trace, act, f)
+    v = _pv_all(trace, act)
+    return isempty(v) ? nothing : f(v)
+end
+function _masked_count(trace, act, α)
+    v = _pv_all(trace, act)
+    return isempty(v) ? nothing : count(>=(α), v)
+end
+_masked_step1(trace, act, α) = (p = _pv_step1(trace, act); p === nothing ? nothing : p >= α)
+
 function _episode_metrics_dict(cfg, sc, pomdp, trace, root_grid, spine_pc,
                                sec_cad, grid_steps, max_steps,
                                n_iterations, seed)
     thr = pomdp.pc_threshold
     epochs_h = [t / 3600 for t in root_grid.t_epochs]
+    # The run's own chance-constraint risk level, for the per-step `masked_*` columns.
+    α_cc_val = Float64(_cfg(cfg, "alpha_cc", MCTS_ALPHA))
 
     # --- per-step trace as a list of flat dicts (t descending; maneuver flag) ---
     # The full 6×6 belief Σ (both objects) is flattened ROW-MAJOR to a 36-vector
@@ -575,6 +641,31 @@ function _episode_metrics_dict(cfg, sc, pomdp, trace, root_grid, spine_pc,
         "sigma_debris_eci_flat" => vec(permutedims(s.sigma_debris)),
         "sigma_sc_pos_m"     => sqrt.(abs.(diag(s.sigma_sc)[1:3])),
         "sigma_debris_pos_m" => sqrt.(abs.(diag(s.sigma_debris)[1:3])),
+        # ---- CHANCE-CONSTRAINT MECHANISM, per root action (empty for the gate
+        # baselines, which never run MCTS). p_viol = P̂[Pc(TCA) > δ | a]; the α gate
+        # MASKS an action when p_viol ≥ α. Flattened per action so each is a plain
+        # scalar column in the wandb Table (queryable / plottable directly).
+        # `masked_*` is the gate outcome recomputed here at the run's own α, so a
+        # reader does not have to re-derive it; a DIFFERENT α can still be applied
+        # post-hoc from p_viol without re-running anything.
+        "n_roll_wait"      => haskey(s.action_stats,"WAIT")     ? s.action_stats["WAIT"].n      : nothing,
+        "p_viol_wait"      => haskey(s.action_stats,"WAIT")     ? s.action_stats["WAIT"].p_viol : nothing,
+        "epc_wait"         => haskey(s.action_stats,"WAIT")     ? s.action_stats["WAIT"].epc    : nothing,
+        "n_roll_maneuver"  => haskey(s.action_stats,"MANEUVER") ? s.action_stats["MANEUVER"].n      : nothing,
+        "p_viol_maneuver"  => haskey(s.action_stats,"MANEUVER") ? s.action_stats["MANEUVER"].p_viol : nothing,
+        "epc_maneuver"     => haskey(s.action_stats,"MANEUVER") ? s.action_stats["MANEUVER"].epc    : nothing,
+        "masked_wait"      => haskey(s.action_stats,"WAIT")     ? s.action_stats["WAIT"].p_viol     >= α_cc_val : nothing,
+        "masked_maneuver"  => haskey(s.action_stats,"MANEUVER") ? s.action_stats["MANEUVER"].p_viol >= α_cc_val : nothing,
+        # Qa = the in-tree mean return (WITH the 1e4 terminal penalty). The LEGACY rule
+        # is argmax-Qa, so with these two columns the legacy decision is reconstructible
+        # offline from a chance-rule run — no separate legacy sweep needed for decision
+        # TIMING (post-divergence outcomes still require real execution).
+        "qa_wait"          => get(s.qa, "WAIT", nothing),
+        "qa_maneuver"      => get(s.qa, "MANEUVER", nothing),
+        # What LEGACY would have chosen at this step (argmax Qa), for direct comparison
+        # with `action`. nothing when Qa is absent (the gate baselines).
+        "legacy_would"     => (isempty(s.qa) ? nothing :
+                               (get(s.qa,"MANEUVER",-Inf) > get(s.qa,"WAIT",-Inf) ? "MANEUVER" : "WAIT")),
     ) for s in trace]
 
     n_steps      = length(trace)
@@ -727,6 +818,17 @@ function _episode_metrics_dict(cfg, sc, pomdp, trace, root_grid, spine_pc,
         "wait_durably_safe"      => wait_durably_safe,
         "crossing_h"             => crossing_h,
         "right_call"             => right_call,
+        # ---- CHANCE-CONSTRAINT rollups (scalars on the summary, so the headline
+        # masking numbers need no Table parsing). All `nothing` for the gate baselines.
+        # `wait_masked_steps` counts steps where the α gate excluded WAIT — the direct
+        # answer to "how often did the constraint bind?".
+        "p_viol_wait_step1"   => _pv_step1(trace, "WAIT"),
+        "p_viol_wait_max"     => _pv_agg(trace, "WAIT", maximum),
+        "p_viol_wait_mean"    => _pv_agg(trace, "WAIT", xs -> sum(xs)/length(xs)),
+        "n_roll_wait_step1"   => _nr_step1(trace, "WAIT"),
+        "wait_masked_steps"   => _masked_count(trace, "WAIT", α_cc_val),
+        "wait_masked_step1"   => _masked_step1(trace, "WAIT", α_cc_val),
+        "alpha_cc_used"       => α_cc_val,
         "actual_decision"        => actual,
         "decision_matches_feasibility" => decision_matches_feasibility,
         # ---- well-formedness self-check ----

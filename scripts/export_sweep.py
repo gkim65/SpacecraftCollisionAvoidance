@@ -48,9 +48,14 @@ from collections import Counter, defaultdict
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(REPO, "figureScripts", "data")
 
+# The v2 re-runs (2026-08-14, faster hardware) SUPERSEDE the original chance/legacy
+# projects. They are the same grid and the same config (root_rule, n_iter=100, cadence
+# {2,4,8,24}); v1 was only ever partial. Do NOT pull v1 and v2 together — both tag the
+# same variant name, so the same (case, quality, cadence, seed) cell would be counted
+# twice and the coverage report would read as over-complete.
 PROJECTS = [
-    "kmeans_gsopt/spacecraftCA-mcts-chance",   # root_rule=chance  -> mcts_chance
-    "kmeans_gsopt/spacecraftCA-mcts-legacy",   # root_rule=legacy  -> mcts_soft_penalty
+    "kmeans_gsopt/spacecraftCA-mcts-chance-v2",   # root_rule=chance -> mcts_chance
+    "kmeans_gsopt/spacecraftCA-mcts-legacy-v2",   # root_rule=legacy -> mcts_soft_penalty
     "kmeans_gsopt/spacecraftCA-mcts-clean",    # superseded MCTS sweep -> mcts (legacy export)
     "kmeans_gsopt/spacecraftCA-belief-mcts",
 ]

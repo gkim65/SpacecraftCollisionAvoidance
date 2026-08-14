@@ -57,6 +57,12 @@ HEADLINE_KEYS = [
     "lead_time_at_first_maneuver_h", "maneuver_mitigated", "maneuver_effective",
     "final_miss_m", "n_steps", "wall_time_s", "well_formed",
     "sec_class", "horizon_h", "miss_cdm_m", "relative_speed_mps", "pc_cdm", "valid_2d",
+    # chance-constraint mechanism (null for the gate baselines, which never run MCTS):
+    # p_viol = P^[Pc(TCA) > delta | WAIT] is what the alpha gate tests, and
+    # wait_masked_* says whether/how often the gate actually excluded WAIT. These make
+    # the masking decision recoverable from a sweep -- it previously reached stdout only.
+    "p_viol_wait_step1", "p_viol_wait_max", "p_viol_wait_mean",
+    "n_roll_wait_step1", "wait_masked_steps", "wait_masked_step1", "alpha_cc_used",
 ]
 
 # Nested arrays/lists logged as wandb Tables (queryable, not clutter) rather than

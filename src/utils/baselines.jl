@@ -193,6 +193,14 @@ function make_policy(spec::Union{AbstractDict,Nothing})
     kind = get(spec, "kind", "mcts")
     if kind == "mcts"
         return mcts_policy
+    elseif kind == "mcts_forced_wait"
+        # PROBE arm: run the planner at every epoch (so p_viol / E[Pc] / Qa are logged
+        # on the true DEFERRAL trajectory) but always execute WAIT. Lets ANY α and
+        # EITHER root rule be replayed offline from one run — see mcts_policy's
+        # `force_wait` note for the validity limit (decision TIMING only; post-
+        # divergence outcomes need real execution).
+        return (pomdp, root, rng; kwargs...) ->
+            mcts_policy(pomdp, root, rng; force_wait = true, kwargs...)
     elseif kind == "delay_gate"
         haskey(spec, "T_act_h") || error("make_policy: delay_gate needs \"T_act_h\".")
         return delay_gate_policy(Float64(spec["T_act_h"]) * 3600)
@@ -200,7 +208,7 @@ function make_policy(spec::Union{AbstractDict,Nothing})
         return wait_feasibility_policy()
     else
         error("make_policy: unknown policy kind \"$kind\" " *
-              "(expected \"mcts\", \"delay_gate\", or \"wait_feasibility\").")
+              "(expected \"mcts\", \"mcts_forced_wait\", \"delay_gate\", or \"wait_feasibility\").")
     end
 end
 
@@ -227,6 +235,8 @@ function policy_variant_spec(variant::AbstractString)
     v = String(variant)
     if v == "mcts"
         return "mcts", nothing
+    elseif v == "mcts_forced_wait"
+        return "mcts_forced_wait", nothing
     elseif v == "wait_feasibility"
         return "wait_feasibility", nothing
     elseif startswith(v, "delay_") && endswith(v, "h")
@@ -237,6 +247,6 @@ function policy_variant_spec(variant::AbstractString)
         return "delay_gate", Dict{String,Any}("T_act_h" => T)
     else
         error("policy_variant_spec: unknown policy_variant \"$v\" " *
-              "(expected \"mcts\", \"wait_feasibility\", or \"delay_<hours>h\").")
+              "(expected \"mcts\", \"mcts_forced_wait\", \"wait_feasibility\", or \"delay_<hours>h\").")
     end
 end
