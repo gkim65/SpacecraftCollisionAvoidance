@@ -1,0 +1,91 @@
+# =============================================================================
+# sweep_parrival_v3_p10_topup.yaml — p=1.0 ANCHOR TOP-UP (2026-08-14)
+#
+# RUN THIS LAST, on whichever cluster frees up first. It is not on the critical path:
+# the four p<1 files (p08/p06/p04/p02) are the actual degradation curve; this fills in
+# the full-information reference point they are measured against.
+#
+# WHY IT IS NEEDED — what already exists for case 40059 at 4 h cadence, p_arrival=1.0:
+#     mcts, chance  : 5 seeds x 3 quality   (from spacecraftCA-mcts-chance-v2)
+#     mcts, legacy  : 5 seeds x 3 quality   (from spacecraftCA-mcts-legacy-v2)
+#     delay_* gates : NONE
+#     wait_feasibility (oracle) : NONE
+# So the MCTS anchor exists but is thin (5 seeds => 95% CI at 0.5 ~ +/-44%, against
+# +/-18% at the 30-seed p<1 points — a visibly wobbly leftmost point), and the gate /
+# oracle curves have NO anchor at all. Without it you cannot show the thing the sweep is
+# for: all policies START CONVERGED at full information and DIVERGE only as arrival
+# degrades. The gate curves would simply begin at p=0.8 with no reference.
+#
+# p_arrival = 1.0 is not "probability set high" — the code SKIPS the Bernoulli draw
+# entirely, so these runs are byte-identical to the guaranteed-measurement path. That is
+# why the existing 60 chance-v2/legacy-v2 runs at p_arrival=1 are directly reusable and
+# this file only needs to cover what is MISSING. (Verified: all 60 carry p_arrival=1.)
+#
+# SEEDS 1-30 here vs 1-5 in the main sweeps: seeds 1-5 will DUPLICATE the existing mcts
+# runs. That is deliberate and cheap (30 mcts cells) — it keeps this file a single
+# rectangular grid instead of a fiddly seed-offset, and gives a free reproducibility
+# check (same seed + same config should reproduce the same decision; chance-v2 already
+# showed 7 such retry pairs agreeing exactly). DEDUPE ON (case, cadence, quality, seed,
+# policy, rule, p_arrival) AT ANALYSIS TIME — export_sweep.py has NO dedup logic, so
+# duplicates would otherwise be double-weighted in any aggregate.
+#
+# COST: 180 mcts (0.31 h) + 180 oracle (~0.04 h) + 720 gate (~0.03 h) = 1080 cells
+# ~= 85 agent-hours => ~1.7 h on 50 agents, the same shape as each p<1 file.
+#
+# Everything else is IDENTICAL to the p<1 files (case, cadence, seeds, policies, rules,
+# n_iter, sigma_mode, leaf_only_pc) so the p=1.0 point is directly comparable to them —
+# the ONLY difference is p_arrival. Same project, so the curve assembles in one place.
+#
+# LAUNCH:
+#   wandb sweep scripts/sweep_parrival_v3_p10_topup.yaml
+#   for i in $(seq 1 50); do tmux new-session -d "cd $(pwd) && source .venv/bin/activate \
+#     && export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 JULIA_NUM_THREADS=1 \
+#     MKL_NUM_THREADS=1 && wandb agent kmeans_gsopt/spacecraftCA-parrival-v3/<ID>"; sleep 2; done
+# =============================================================================
+
+program: scripts/wandb_runner.py
+method: grid
+project: spacecraftCA-parrival-v3      # SAME project as the four p<1 splits
+entity: kmeans_gsopt
+
+command:
+  - uv
+  - run
+  - python
+  - ${program}
+  - --timeout-s
+  - "172800"
+
+parameters:
+  p_arrival:
+    values: [1.0]                      # THE ANCHOR — Bernoulli draw skipped entirely
+  cadence_h:
+    values: [4]
+  case_path:
+    values:
+      - data/cara_cdms/000040059_conj_000035921_20220326_194122_20220325_215435.cdm
+  sensor_quality:
+    values: [best, median, worst]
+  seed:
+    values: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+             16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
+  policy_variant:                      # the gates + oracle are the POINT of this file
+    values: [mcts, delay_28h, delay_12h, delay_6h, delay_3h, wait_feasibility]
+  root_rule:
+    values: [chance, legacy]
+
+  # ---- fixed (identical to the p<1 files) ----
+  n_iterations:
+    value: 100
+  sigma_mode:
+    value: exact
+  reward_mode:
+    value: terminal
+  constraint_mode:
+    value: penalize
+  leaf_only_pc:
+    value: true
+  alpha_cc:
+    value: 0.05
+  grid_mode:
+    value: measurement
