@@ -1,0 +1,112 @@
+# =============================================================================
+# sweep_parrival_v4_p08_07.yaml — ARRIVAL MECHANISM probe, split 2/4 (2026-08-14)
+# NEW PROJECT spacecraftCA-parrival-v4. The v3 files/project are LEFT INTACT — this is
+# a different experiment (a mechanism probe), not a replacement for them.
+#
+# PURPOSE: the alpha-trigger figure. x = p_arrival, y = the epoch (time-to-TCA) at
+# which each alpha value would first burn, one line per alpha (0.02 / 0.05 / 0.10 /
+# 0.20) plus one for the LEGACY rule. As arrival degrades the trigger moves EARLIER,
+# and a stricter alpha triggers sooner — the constraint tightening, in one panel.
+#
+# HOW ONE ARM PRODUCES ALL OF THAT: policy_variant = mcts_forced_wait runs the planner
+# at every epoch (so p_viol / E[Pc] / Qa are logged per step) but always EXECUTES WAIT.
+# That is the one trajectory NOT conditioned on a past burn — the true deferral path —
+# so ANY alpha and EITHER root rule can be replayed offline:
+#     chance at alpha a : first epoch where p_viol(WAIT) >= a
+#     legacy            : first epoch where argmax Qa = MANEUVER  (logged as legacy_would)
+# WARNING: VALID FOR DECISION TIMING ONLY. After the first divergence this trace is the
+# wrong trajectory (a real episode would carry a maneuvered belief), so post-burn
+# outcomes — final Pc, Dv spent, whether the burn mitigated — are NOT recoverable here
+# and still need real executed episodes. Do not report this arm as a policy: it never
+# maneuvers by construction, so it is a probe, not an idealized baseline.
+#
+# WHY NO plain mcts / no root_rule axis: both are reconstructible from the forced-WAIT
+# trace (above), so running them would duplicate work. Real mcts outcomes at p=1.0
+# already exist in spacecraftCA-mcts-chance-v2 (480/480) and -legacy-v2 (435/480).
+#
+# WHY n_iterations = 500 (NOT 100): measured 2026-08-14 on this case — at n_iter=100
+# UCB gave WAIT only 11 of 100 rollouts at step 1, so the finest expressible p_viol is
+# 1/11 = 0.0909, ALREADY above alpha=0.05. WAIT was masked by a SINGLE violating
+# rollout and the gate degenerated to worst-case (alpha -> 0). Deferring was correct
+# there: the forced-WAIT trace shows Pc falling 7.9e-04 -> 8.0e-12 over the episode,
+# and both rules burned at step 1 anyway. This is the alpha-n_iter coupling the design
+# record warns about, and n_iter=100 does NOT fix it — the binding quantity is
+# PER-ACTION allocation at the root, not the total. At n_iter=500 WAIT gets ~55
+# rollouts, so the finest p_viol is ~0.018 and it takes 3 violating rollouts to mask.
+# A proper fix is a minimum-rollouts-per-action floor before the gate applies; that is
+# a planner change and is NOT done here.
+#
+# WARNING: 1 SEED ONLY (seed 1). Deliberate time-boxed first pass: at 1 seed the whole
+# grid is ONE wave, so wall clock = one episode (~1.5 h at n_iter=500 — itself
+# EXTRAPOLATED from a measured 0.31 h at n_iter=100; never measured above 100).
+# CONSEQUENCE: this yields the MECHANISM plot only. There is no defer-RATE curve and no
+# error bars — a rate is a seed-average and 1 seed cannot estimate one. To extend, rerun
+# these same files with seed: [2, 3, 4, ...]; results accumulate in the same project.
+#
+# p GRID {1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3}, 2 per file. p=1.0 is the reference
+# where the constraint should never fire (the existing chance-v2 p=1.0 data can NOT
+# substitute: it predates this logging and ran plain mcts). 0.2 is dropped as saturated
+# — a WAIT-spine probe found WAIT unsafe 8/12 there, so every alpha masks and the replay
+# is uninformative. The cliff sits between 0.6 and 0.8 (WAIT safe 12/12 at 0.8, 10/12 at
+# 0.6), so 0.8-0.3 covers the transition and its tail.
+#
+# CASE = 000040059: defers 75% at p=1.0 in the complete chance-v2 sweep at 0.31 h per
+# episode, vs 25994 at 71.7% but 2.29 h — same behaviour for 1/7th the cost.
+#
+# sigma_mode MUST stay exact (fast is invalid under p_arrival < 1; guarded in code).
+# leaf_only_pc: true — behavior-neutral ~1.7-2x, verified bit-identical at the knife-edge.
+#
+# LAUNCH (one file per cluster, all four in parallel). Single-threaded per agent is
+# REQUIRED (else each spawns one BLAS thread per core). NOTE: 50 and 30 agents both died
+# with SIGTERM on the v3 project; 10 ran clean — cause NOT diagnosed, so keep it low.
+#   wandb sweep scripts/sweep_parrival_v4_p08_07.yaml
+#   for i in $(seq 1 10); do tmux new-session -d "cd $(pwd) && source .venv/bin/activate \
+#     && export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 JULIA_NUM_THREADS=1 \
+#     MKL_NUM_THREADS=1 && wandb agent kmeans_gsopt/spacecraftCA-parrival-v4/<ID>"; sleep 2; done
+# =============================================================================
+
+program: scripts/wandb_runner.py
+method: grid
+project: spacecraftCA-parrival-v4      # NEW project; v3 untouched
+entity: kmeans_gsopt
+
+command:
+  - uv
+  - run
+  - python
+  - ${program}
+  - --timeout-s
+  - "172800"
+
+parameters:
+  p_arrival:
+    values: [0.8, 0.7]                  # THIS SPLIT ONLY
+  policy_variant:
+    values: [mcts_forced_wait]         # the probe arm — see the header
+  cadence_h:
+    values: [4]
+  case_path:
+    values:
+      - data/cara_cdms/000040059_conj_000035921_20220326_194122_20220325_215435.cdm
+  sensor_quality:
+    values: [best, median, worst]
+  seed:
+    values: [1]                        # time-boxed first pass; add seeds to extend
+
+  # ---- fixed ----
+  root_rule:
+    value: chance                      # legacy replayed offline from qa_* / legacy_would
+  n_iterations:
+    value: 500                         # see the alpha-n_iter note in the header
+  sigma_mode:
+    value: exact                       # REQUIRED under p_arrival < 1
+  reward_mode:
+    value: terminal
+  constraint_mode:
+    value: penalize
+  leaf_only_pc:
+    value: true
+  alpha_cc:
+    value: 0.05                        # the run's own alpha; others replayed from p_viol
+  grid_mode:
+    value: measurement
