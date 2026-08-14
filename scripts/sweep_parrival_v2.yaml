@@ -1,0 +1,133 @@
+# =============================================================================
+# sweep_parrival_v2.yaml — F5 PROBABILISTIC MEASUREMENT ARRIVAL, v2 rerun (2026-08-14)
+#
+# THE EXPERIMENT: a SCHEDULED debris (SSN/TLE) fix arrives with probability p_arrival;
+# on a non-arrival that step is predict-only (Σ grows, no innovation). The satellite GPS
+# fix is NOT gated (own-asset continuous track). Cadence is deterministic and a fixed
+# clock can be tuned to it; RANDOM non-arrival is the thing a fixed clock structurally
+# CANNOT tune to — so this is the axis that separates reasoning-about-arrival (MCTS)
+# from committing-blind (the delay gates).
+#
+# WHY A RERUN (two reasons, the first methodological):
+#  1. The existing `spacecraftCA-parrival` project is 2880/2880 FINISHED but ran at
+#     **n_iterations = 12**. p_viol is a Monte-Carlo estimate from ~n_iter/2 rollouts per
+#     action, so at n_iter=12 the finest resolvable violation fraction is ~1/6 ≈ 0.14 —
+#     α=0.05 is NOT honestly estimable and the gate collapses toward worst-case. The
+#     chance-constraint design doc names n_iter=12 + α=0.05 "the one quietly-WRONG
+#     combo". This rerun uses n_iterations = 100 (~50 rollouts/action, resolution ~0.02).
+#  2. It predates the chance rule and the leaf-only Pc path, so provenance is mixed.
+#
+# WHAT CHANGED vs sweep_parrival.yaml
+#  • n_iterations 12 → 100                    (the methodological fix above)
+#  • p_arrival: 4 → 9 values, uniform 10% steps (dose-response curve, not 4 points)
+#  • case_path: 8 cases → 1 (000025994)      (see CASE SELECTION below)
+#  • root_rule: NEW AXIS {chance, legacy}    (the paired rule contrast under arrival risk)
+#  • seed: 5 → 30                            (arrival is STOCHASTIC; 5 draws is too few)
+#  • leaf_only_pc: true                      (behavior-neutral ~1.7-2x; see below)
+#  • FRESH project so v2 never mixes with the n_iter=12 data
+#
+# CASE SELECTION — 000025994, the AMBIGUOUS case (Grace's call, picked on EVIDENCE):
+# classified from the existing chance sweep by defer-vs-maneuver rate across quality and
+# seeds: 40115 100% defer, 40059 80%, **25994 53.3%**, 38771 32%, 29108 20%, 37849 8.9%,
+# 33591 / 28654 0%. 25994 is the genuine coin flip — the ONE case where deferral is a
+# real choice, so degrading arrival can actually FLIP the decision. A 0%-defer case
+# cannot defer less and a 100%-defer case has too much margin to move, so both would
+# give flat curves and waste budget. (Those rates come from a PARTIAL sweep with uneven
+# cell counts (30-75) — good enough to pick a case, not a number to quote.)
+#
+# GRID: 1 case × 3 quality × 30 seeds × 9 p_arrival × 6 policies × 2 rules.
+#   HEAVY cells = mcts only: 3 × 30 × 9 × 2 = **1620 episodes**.
+#   The other 8100 cells are gate baselines (delay_*h / wait_feasibility) — they read Pc
+#   off the same belief and decide WITHOUT running MCTS, so they are ~seconds each.
+#   NOTE: root_rule only affects the MCTS policy (gates never call the planner), so the
+#   gate cells are duplicated across the rule axis. That is wasted-but-cheap; it keeps
+#   the grid rectangular rather than needing two files.
+#
+# CADENCE = 4 h (deliberately NOT 2 h): (a) the existing p_arrival data is 4 h, so
+# holding cadence fixed means the rule + n_iter are the only changes and any difference
+# is attributable; (b) ~7 grid steps vs 13, so roughly half the per-episode cost; (c) at
+# 2 h there are so many scheduled fixes that losing half still leaves plenty — measured
+# 2026-08-14, 38771 best at 2 h sat at p_viol=0.0000 with huge margin while the same case
+# at 8 h sat at the α knife-edge. A fine cadence can WASH OUT the arrival effect.
+#
+# leaf_only_pc = true: skips the to-TCA Pc propagation at INTERNAL tree nodes (valid in
+# :terminal reward mode — the per-step reward is fuel-only and only the LEAF's Pc feeds
+# p_viol / E[Pc]). Verified bit-identical action, per-action n / p_viol / E[Pc], and Qa
+# to all digits on the 38771 defer case AT the α knife-edge (p_viol=0.0370 vs α=0.05).
+# Every wandb metric is unaffected (the executor computes its traced pc itself).
+# ⚠️ sigma_mode MUST be :exact here — :fast is invalid under p_arrival < 1 (stochastic
+# arrival makes the per-depth debris Σ table branch-dependent); the code guards this.
+#
+# COST: measured per-episode on 38771 best/seed 1 — 8 h → 5.2 min, 2 h → 22 min; 4 h is
+# untimed and should land ~10-12 min. So 1620 mcts episodes ≈ 270-325 h serial ≈
+# **~6-7 h at 50 agents**, plus minutes for the gate cells. ⚠️ 38771 best is a FAVOURABLE
+# case (UCB concentrates, less tree explored); 25994 at ~53% defer splits rollouts and
+# will likely cost MORE per episode. Budget with margin.
+#
+# LAUNCH — single-threaded per agent, else each spawns one BLAS thread per core
+# (50 agents × 56 cores ≈ 2800 threads for 56 cores). Export before `wandb agent`:
+#   OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 JULIA_NUM_THREADS=1 MKL_NUM_THREADS=1
+# Memory ~1.3 GB peak per agent ⇒ 50 agents ≈ 64 GB of a 126 GB node.
+#
+# FIGURES this is built to support (x-axis = p_arrival, descending L→R):
+#   A  fraction of episodes that maneuvered   — the behavioural response, one line/policy
+#   B  mean Δv (m/s)                         — the cost of that response
+#   C  fraction with final Pc > δ            — whether safety was actually maintained
+#   B+C together are the real claim: MCTS holds C flat while spending less in B than the
+#   gates. Facet by sensor_quality (3 panels) — quality and p_arrival are two different
+#   information levers (precision vs frequency), so the curves should ORDER: worst
+#   quality's knee at higher p (less margin ⇒ gives up on deferral sooner). Grace also
+#   wants a stacked maneuver/no-maneuver split as its own subplot. Put binomial CIs on A:
+#   at 90 episodes per (quality, p) point the resolution is ~1/90 and the CI near 0.5 is
+#   roughly ±10%. DO NOT assume safety holds at every p — plot C and let it say so; a
+#   tracking-reliability floor below which the guarantee fails is a FINDING, not a bug.
+# =============================================================================
+
+program: scripts/wandb_runner.py
+method: grid
+project: spacecraftCA-parrival-v2      # FRESH project — v2 (n_iter=100, both rules)
+entity: kmeans_gsopt
+
+command:
+  - uv
+  - run
+  - python
+  - ${program}
+  - --timeout-s          # per-episode Julia timeout: 48 h. Generous headroom — n_iter=100
+  - "172800"             # at 4 h cadence is ~8x the n_iter=12 runs this file replaces.
+
+parameters:
+  cadence_h:
+    values: [4]                        # 4 h ONLY — see the CADENCE note in the header
+  case_path:
+    values:
+      # THE AMBIGUOUS CASE (53.3% defer) — where deferral is a genuine choice
+      - data/cara_cdms/000025994_conj_000026132_20220224_100307_20220221_225515.cdm
+  sensor_quality:
+    values: [best, median, worst]      # 3 panels: precision lever vs the frequency lever
+  seed:
+    values: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+             11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+             21, 22, 23, 24, 25, 26, 27, 28, 29, 30]   # 30 — arrival is STOCHASTIC
+  policy_variant:                      # mcts + the gate baselines + the oracle reference
+    values: [mcts, delay_28h, delay_12h, delay_6h, delay_3h, wait_feasibility]
+  p_arrival:                           # uniform 10% steps; 1.0 = regression anchor
+    values: [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2]
+  root_rule:                           # NEW AXIS — the paired rule contrast
+    values: [chance, legacy]           # (ignored by the gate policies: no planner call)
+
+  # ---- fixed knobs ----
+  n_iterations:
+    value: 100                         # THE FIX: ~50 rollouts/action ⇒ α=0.05 estimable
+  sigma_mode:
+    value: exact                       # REQUIRED: :fast is invalid under p_arrival < 1
+  reward_mode:
+    value: terminal
+  constraint_mode:
+    value: penalize                    # in-tree per-step handling (search unchanged)
+  leaf_only_pc:
+    value: true                        # behavior-neutral ~1.7-2x; logged for provenance
+  alpha_cc:
+    value: 0.05                        # risk level (Blackmore/Ono); ignored under legacy
+  grid_mode:
+    value: measurement
