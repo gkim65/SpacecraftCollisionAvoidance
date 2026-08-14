@@ -668,6 +668,10 @@ function _episode_metrics_dict(cfg, sc, pomdp, trace, root_grid, spine_pc,
             "sigma_mode"      => String(_sym(_cfg(cfg, "sigma_mode", :exact))),
             "reward_mode"     => String(_sym(_cfg(cfg, "reward_mode", :terminal))),
             "constraint_mode" => String(_sym(_cfg(cfg, "constraint_mode", :penalize))),
+            # Which Pc path produced this run (provenance): true = internal-node to-TCA
+            # propagation skipped (leaf-only). Behavior-neutral, but the pre-2026-08-14
+            # sweeps ran with it false, so log it to keep the two distinguishable.
+            "leaf_only_pc"    => Bool(_cfg(cfg, "leaf_only_pc", MCTS_LEAF_ONLY_PC)),
             "n_iterations"    => n_iterations,
             "grid_steps"      => grid_steps,
             "max_steps"       => max_steps,
