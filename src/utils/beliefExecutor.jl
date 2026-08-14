@@ -207,17 +207,11 @@ function run_episode(planner::MCTSPlanner, pomdp::SpacecraftCAPOMDP, s0::CAState
         # world on the same timeline the planner optimized over.
         step_planner = planner
         if grid_builder !== nothing
-            g = grid_builder(t_remaining)
-            step_planner = MCTSPlanner(pomdp;
-                n_iterations = planner.n_iterations, max_depth = planner.max_depth,
-                c = planner.c, k = planner.k, α = planner.α, dt = planner.dt,
-                cadence_sc = planner.cadence_sc, cadence_debris = planner.cadence_debris,
-                constraint_mode = planner.constraint_mode, pc_weight = planner.pc_weight,
-                pc_penalty = planner.pc_penalty, sigma_mode = planner.sigma_mode,
-                parallel = planner.parallel, n_workers = planner.n_workers,
-                reward_mode = planner.reward_mode, terminal_penalty = planner.terminal_penalty,
-                p_arrival = planner.p_arrival, α_cc = planner.α_cc,
-                root_rule = planner.root_rule, grid = g)
+            # `with_grid` copies EVERY planner field reflectively and swaps only the
+            # grid (re-capping max_depth). It replaced a hand-written field-by-field
+            # copy that silently dropped any newly added field — see with_grid's
+            # docstring (beliefMCTS.jl) for the leaf_only_pc regression that caused.
+            step_planner = with_grid(planner, grid_builder(t_remaining))
         end
         exec_grid = step_planner.grid
 

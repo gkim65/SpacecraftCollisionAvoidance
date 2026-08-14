@@ -1687,6 +1687,35 @@ function MCTSPlanner(pomdp::SpacecraftCAPOMDP;
 end
 
 """
+    with_grid(planner, grid) -> MCTSPlanner
+
+Copy `planner`, replacing ONLY its `grid` (and re-capping `max_depth` to the new
+grid's step count, exactly as the keyword constructor does). Every other field is
+carried over REFLECTIVELY via `fieldnames`, so this CANNOT silently drop a field.
+
+WHY THIS EXISTS (2026-08-14): the receding-horizon executor rebuilds a per-step
+planner from the current time-to-TCA. It used to do that by listing every field by
+hand, which meant any field added to `MCTSPlanner` later was silently dropped and
+reverted to its module default in every executed episode — `leaf_only_pc` was added
+and lost exactly this way, so full episodes quietly ran the un-optimized path while
+single-plan tests (which call `plan`/`run_sims!` directly) all passed. Field-by-field
+copying is the bug; enumerate the fields instead. ANY new `MCTSPlanner` field is
+picked up here automatically — do NOT reintroduce a hand-written copy.
+"""
+function with_grid(planner::MCTSPlanner, grid::Union{DecisionGrid,Nothing})
+    vals = Any[getfield(planner, f) for f in fieldnames(MCTSPlanner)]
+    gi = findfirst(==(:grid), collect(fieldnames(MCTSPlanner)))
+    di = findfirst(==(:max_depth), collect(fieldnames(MCTSPlanner)))
+    vals[gi] = grid
+    # Same depth cap the keyword constructor applies: on a grid, a rollout reaches
+    # TCA in grid_depth_count steps, so max_depth must not exceed it.
+    if grid !== nothing
+        vals[di] = min(planner.max_depth, grid_depth_count(grid))
+    end
+    return MCTSPlanner(vals...)
+end
+
+"""
     run_sims!(planner, root, rng; n_iterations=planner.n_iterations, table=<built>)
         -> (root, table)
 
