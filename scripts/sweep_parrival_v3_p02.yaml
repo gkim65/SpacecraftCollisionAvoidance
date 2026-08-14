@@ -1,0 +1,98 @@
+# =============================================================================
+# sweep_parrival_v3_p02.yaml — F5 arrival sweep, SPLIT 4/4 (2026-08-14)
+#
+# ONE p_arrival value per file so the 4 clusters cover the CURVE IN PARALLEL instead of
+# depth-first. The v2 single-file run exposed the problem: wandb's grid controller walks
+# the parameter space in declaration order, so after ~14 h every finished cell was
+# p_arrival=1.0 / chance and the degradation curve had NOTHING. Splitting by p value
+# means partial results are still a usable curve.
+#
+# BUDGET-DRIVEN DESIGN (4 h window, measured 3.35 h/episode for these cells):
+#   at 3.35 h/episode you fit ~ONE episode per agent slot, so the grid is sized to the
+#   AGENT COUNT, not to queue depth. 3 quality x 15 seeds = 45 mcts cells per file, on
+#   50 agents => one wave, every cell starts immediately (a slow outlier delays nothing).
+#   4 files x 45 = 180 mcts cells total.
+#
+# CHANCE ONLY (no root_rule axis): adding legacy would halve the seeds to ~7 (95% CI
+# +/-37% per cell) which is unreadable. The chance-vs-legacy contrast is already carried
+# by the completed paired sweeps spacecraftCA-mcts-{chance,legacy}-v2 (480/480 and
+# 435/480). Revisit arrival x rule when there is more than a 4 h window.
+#
+# p=1.0 IS DEPLOYED SEPARATELY — do NOT re-run it here. spacecraftCA-parrival-v2 already
+# has chance-rule mcts at p=1.0 with 25 (best) / 28 (median) / 28 (worst) seeds finished.
+# Combined with these files the curve reads 1.0, 0.8, 0.6, 0.4, 0.2 at even 0.2 steps.
+# ⚠️ CAVEAT: parrival-v2 has NO legacy and NO gate cells at p=1.0 (0 of 30 combos), so
+# the gate baselines here have no full-information anchor. If the figure needs the gates
+# to start converged with mcts, a p=1.0 gate-only top-up is required (gate cells are
+# ~seconds each, so that is cheap — a small dedicated file, not a rerun).
+#
+# CASE = 000025994, the AMBIGUOUS case: 53.3% defer across quality/seeds in the existing
+# chance sweep (vs 40115 100%, 28654/33591 0%). The one case where deferral is a genuine
+# choice, so degrading arrival can actually FLIP the decision; a 0%- or 100%-defer case
+# would give a flat line. (Rates from a partial sweep — fine for picking, not to quote.)
+#
+# sigma_mode MUST stay :exact — :fast is INVALID under p_arrival < 1 (stochastic arrival
+# makes the per-depth debris Sigma table branch-dependent). The code guards this.
+# leaf_only_pc: true — behavior-neutral ~1.7-2x, verified bit-identical on the 38771
+# defer case at the alpha knife-edge; logged per run for provenance.
+#
+# SAMPLE SIZE, stated honestly: 15 seeds per (quality, p) cell => 95% CI at 0.5 is
+# ~+/-25%. Pooling the 3 qualities gives n=45 => ~+/-15%. So the per-quality curves show
+# a DIRECTION, and the pooled curve is the one to quote. This is a coarse 5-point curve:
+# good for a trend, not for locating a knee precisely.
+#
+# LAUNCH (one file per cluster, all four in parallel):
+#   wandb sweep scripts/sweep_parrival_v3_p02.yaml
+#   for i in $(seq 1 50); do tmux new-session -d "cd $(pwd) && source .venv/bin/activate \
+#     && export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 JULIA_NUM_THREADS=1 \
+#     MKL_NUM_THREADS=1 && wandb agent kmeans_gsopt/spacecraftCA-parrival-v3/<ID>"; sleep 2; done
+# Single-threaded per agent is REQUIRED: otherwise each spawns one BLAS thread per core
+# (50 x 56 = ~2800 threads for 56 cores). ~1.3 GB peak per agent => 50 agents ~64 GB.
+# All four files write to the SAME project so the curve lands in one place.
+# =============================================================================
+
+program: scripts/wandb_runner.py
+method: grid
+project: spacecraftCA-parrival-v3      # ONE project for all 4 splits
+entity: kmeans_gsopt
+
+command:
+  - uv
+  - run
+  - python
+  - ${program}
+  - --timeout-s          # 48 h per-episode ceiling: these cells run ~3.35 h at the
+  - "172800"             # median and a 6 h tail was observed on the main sweeps.
+
+parameters:
+  p_arrival:
+    values: [0.2]                     # THIS SPLIT ONLY (p=1.0 reused from v2)
+  cadence_h:
+    values: [4]                        # 4 h: matches the existing data; ~7 grid steps
+  case_path:
+    values:
+      - data/cara_cdms/000025994_conj_000026132_20220224_100307_20220221_225515.cdm
+  sensor_quality:
+    values: [best, median, worst]
+  seed:
+    values: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+  policy_variant:
+    values: [mcts, delay_28h, delay_12h, delay_6h, delay_3h, wait_feasibility]
+
+  # ---- fixed ----
+  root_rule:
+    value: chance                      # chance ONLY — see the header
+  n_iterations:
+    value: 100                         # ~50 rollouts/action => alpha=0.05 estimable
+  sigma_mode:
+    value: exact                       # REQUIRED under p_arrival < 1
+  reward_mode:
+    value: terminal
+  constraint_mode:
+    value: penalize
+  leaf_only_pc:
+    value: true
+  alpha_cc:
+    value: 0.05
+  grid_mode:
+    value: measurement
