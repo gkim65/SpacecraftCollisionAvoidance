@@ -1,54 +1,59 @@
 # =============================================================================
 # sweep_parrival_v3_p02.yaml — F5 arrival sweep, SPLIT 4/4 (2026-08-14)
 #
-# ONE p_arrival value per file so the 4 clusters cover the CURVE IN PARALLEL instead of
-# depth-first. The v2 single-file run exposed the problem: wandb's grid controller walks
-# the parameter space in declaration order, so after ~14 h every finished cell was
-# p_arrival=1.0 / chance and the degradation curve had NOTHING. Splitting by p value
-# means partial results are still a usable curve.
+# ONE p_arrival value per file so 4 clusters cover the CURVE IN PARALLEL rather than
+# depth-first. The single-file v2 run showed why: wandb's grid controller walks the
+# parameter space in declaration order, so after ~14 h every finished cell was
+# p_arrival=1.0 / chance and the degradation curve had NOTHING. Split by p value and
+# partial results are still a usable curve.
 #
-# BUDGET-DRIVEN DESIGN (4 h window, measured 3.35 h/episode for these cells):
-#   at 3.35 h/episode you fit ~ONE episode per agent slot, so the grid is sized to the
-#   AGENT COUNT, not to queue depth. 3 quality x 15 seeds = 45 mcts cells per file, on
-#   50 agents => one wave, every cell starts immediately (a slow outlier delays nothing).
-#   4 files x 45 = 180 mcts cells total.
+# ALL SIX POLICIES ride along in every file (policy_variant axis), so the baselines and
+# the offline oracle are split across the clusters automatically — no separate files.
+# Measured cost ratios (old parrival project): mcts 615 s, wait_feasibility 79 s (0.13x),
+# delay_* 58-62 s (0.10x). Per file: 180 mcts + 180 oracle + 720 gate = 1080 cells
+# ~= 85 agent-hours => ~1.7 h on 50 agents (~2.1 h worst case).
 #
-# CHANCE ONLY (no root_rule axis): adding legacy would halve the seeds to ~7 (95% CI
-# +/-37% per cell) which is unreadable. The chance-vs-legacy contrast is already carried
-# by the completed paired sweeps spacecraftCA-mcts-{chance,legacy}-v2 (480/480 and
-# 435/480). Revisit arrival x rule when there is more than a 4 h window.
+# CASE = 000040059 (switched from 25994 — see COST below). From the COMPLETE chance-v2
+# sweep (480/480), defer rate by case at 4 h cadence:
+#     40115 100% (0.51h) · 40059 75% (0.31h) · 25994 71.7% (2.29h) · 29108 34% ·
+#     38771 33% · 37849 18% · 33591 0% · 28654 0%
+# 40059 defers 75% of the time — high enough that deferral has real room to FALL as
+# arrival degrades, but NOT saturated like 40115's 100% (which may be too safe to move).
+# Per quality: best 90% / median 70% / worst 65%.
 #
-# p=1.0 IS DEPLOYED SEPARATELY — do NOT re-run it here. spacecraftCA-parrival-v2 already
-# has chance-rule mcts at p=1.0 with 25 (best) / 28 (median) / 28 (worst) seeds finished.
-# Combined with these files the curve reads 1.0, 0.8, 0.6, 0.4, 0.2 at even 0.2 steps.
-# ⚠️ CAVEAT: parrival-v2 has NO legacy and NO gate cells at p=1.0 (0 of 30 combos), so
-# the gate baselines here have no full-information anchor. If the figure needs the gates
-# to start converged with mcts, a p=1.0 gate-only top-up is required (gate cells are
-# ~seconds each, so that is cheap — a small dedicated file, not a rerun).
+# COST — why not 25994: it defers at a near-identical rate (71.7%) but costs 2.29 h per
+# episode vs 0.31 h, i.e. **7.4x more**, because at ~50/50 UCB genuinely explores both
+# branches and builds a far larger tree. The v2 single-file run was sized off 38771
+# (0.41 h, the CHEAPEST case) and then run on 25994, which is why it blew its budget by
+# ~7x. 40059 buys back every statistical compromise that cost forced.
+# TRADEOFF: 40059's quality spread is narrower (90/70/65) than 25994's (85/75/55), so the
+# per-quality degradation panels may look less dramatic. Accepted for 7x the throughput.
 #
-# CASE = 000025994, the AMBIGUOUS case: 53.3% defer across quality/seeds in the existing
-# chance sweep (vs 40115 100%, 28654/33591 0%). The one case where deferral is a genuine
-# choice, so degrading arrival can actually FLIP the decision; a 0%- or 100%-defer case
-# would give a flat line. (Rates from a partial sweep — fine for picking, not to quote.)
+# p=1.0 IS NOT RE-RUN HERE. spacecraftCA-parrival-v2 already has chance-rule mcts at
+# p=1.0 with 25/28/28 seeds by quality. With these files the curve reads 1.0, 0.8, 0.6,
+# 0.4, 0.2 at even steps.
+# ⚠️ GAP: parrival-v2 has NO legacy and NO gate cells at p=1.0 (0 of 30 combos), so the
+# gates/oracle have no full-information anchor. Gate cells are ~60 s each, so a small
+# p=1.0 gate-only top-up is cheap if the figure needs all policies to start converged.
+# ⚠️ Also note parrival-v2's p=1.0 mcts ran on 25994, NOT 40059 — so it is NOT a valid
+# anchor for these files. The p=1.0 point for 40059 must come from chance-v2 (4h cadence,
+# p_arrival=1.0, 15 seeds/quality) or a dedicated top-up.
 #
 # sigma_mode MUST stay :exact — :fast is INVALID under p_arrival < 1 (stochastic arrival
-# makes the per-depth debris Sigma table branch-dependent). The code guards this.
+# makes the per-depth debris Sigma table branch-dependent). Guarded in code.
 # leaf_only_pc: true — behavior-neutral ~1.7-2x, verified bit-identical on the 38771
-# defer case at the alpha knife-edge; logged per run for provenance.
+# defer case at the alpha knife-edge.
 #
-# SAMPLE SIZE, stated honestly: 15 seeds per (quality, p) cell => 95% CI at 0.5 is
-# ~+/-25%. Pooling the 3 qualities gives n=45 => ~+/-15%. So the per-quality curves show
-# a DIRECTION, and the pooled curve is the one to quote. This is a coarse 5-point curve:
-# good for a trend, not for locating a knee precisely.
+# SAMPLE SIZE: 30 seeds per (quality, p, rule) cell => 95% CI at 0.5 ~ +/-18%; pooled
+# over the 3 qualities n=90 => ~+/-10%. Readable per-cell, good pooled.
 #
-# LAUNCH (one file per cluster, all four in parallel):
+# LAUNCH — one file per cluster, all four in parallel:
 #   wandb sweep scripts/sweep_parrival_v3_p02.yaml
 #   for i in $(seq 1 50); do tmux new-session -d "cd $(pwd) && source .venv/bin/activate \
 #     && export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 JULIA_NUM_THREADS=1 \
 #     MKL_NUM_THREADS=1 && wandb agent kmeans_gsopt/spacecraftCA-parrival-v3/<ID>"; sleep 2; done
-# Single-threaded per agent is REQUIRED: otherwise each spawns one BLAS thread per core
-# (50 x 56 = ~2800 threads for 56 cores). ~1.3 GB peak per agent => 50 agents ~64 GB.
-# All four files write to the SAME project so the curve lands in one place.
+# Single-threaded per agent is REQUIRED (else 50 x 56 = ~2800 threads for 56 cores).
+# ~1.3 GB peak/agent => 50 agents ~64 GB of 126 GB. All four write to ONE project.
 # =============================================================================
 
 program: scripts/wandb_runner.py
@@ -61,29 +66,30 @@ command:
   - run
   - python
   - ${program}
-  - --timeout-s          # 48 h per-episode ceiling: these cells run ~3.35 h at the
-  - "172800"             # median and a 6 h tail was observed on the main sweeps.
+  - --timeout-s          # 48 h ceiling. These cells run ~0.31 h (mcts) at the median,
+  - "172800"             # but a 6 h tail was observed on the main sweeps.
 
 parameters:
   p_arrival:
-    values: [0.2]                     # THIS SPLIT ONLY (p=1.0 reused from v2)
+    values: [0.2]                     # THIS SPLIT ONLY
   cadence_h:
-    values: [4]                        # 4 h: matches the existing data; ~7 grid steps
+    values: [4]
   case_path:
     values:
-      - data/cara_cdms/000025994_conj_000026132_20220224_100307_20220221_225515.cdm
+      - data/cara_cdms/000040059_conj_000035921_20220326_194122_20220325_215435.cdm
   sensor_quality:
     values: [best, median, worst]
   seed:
-    values: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-  policy_variant:
+    values: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+             16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
+  policy_variant:                      # mcts + 4 delay gates + the offline oracle
     values: [mcts, delay_28h, delay_12h, delay_6h, delay_3h, wait_feasibility]
+  root_rule:                           # both rules — the arrival x rule contrast
+    values: [chance, legacy]
 
   # ---- fixed ----
-  root_rule:
-    value: chance                      # chance ONLY — see the header
   n_iterations:
-    value: 100                         # ~50 rollouts/action => alpha=0.05 estimable
+    value: 100
   sigma_mode:
     value: exact                       # REQUIRED under p_arrival < 1
   reward_mode:
