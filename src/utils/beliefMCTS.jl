@@ -119,11 +119,11 @@ const MCTS_CONSTRAINT_MODE     = :penalize   # :penalize | :terminate | :off
 # --- REWARD MODE (2026-08-09 redesign; see CONSTANTS.md + the REWARD section) ---
 # Selects WHERE the Pc term is charged (the over-maneuvering fix, memory
 # chance-constraint-framing-tension + the root_decision_probe diagnostic):
-#   :per_step (LEGACY) — charge −pc_weight·Pc at EVERY step and sum it down the
-#       path (the original Phase-6 shaping). Punishes a branch for its wide EARLY
-#       belief even when measurement resolves it by TCA → sinks the wait-and-measure
-#       branch (Q(WAIT) ≈ −19.5k vs Q(MANEUVER) ≈ −13 on SWIFT/JILIN). Kept for the
-#       ablation + the synthetic suites.
+#   :per_step (LEGACY — ⚠️ DO NOT USE FOR NEW WORK, see below) — charge
+#       −pc_weight·Pc at EVERY step and sum it down the path (the original Phase-6
+#       shaping). Punishes a branch for its wide EARLY belief even when measurement
+#       resolves it by TCA → sinks the wait-and-measure branch (Q(WAIT) ≈ −19.5k vs
+#       Q(MANEUVER) ≈ −13 on SWIFT/JILIN).
 #   :terminal (DEFAULT) — Pc is a TERMINAL quantity: the per-step reward is fuel
 #       cost ONLY (no Pc term), and the WHOLE Pc term lives in `leaf_value` at TCA.
 #       A branch is valued by its Pc-AT-TCA (the resolved outcome), not the summed
@@ -131,7 +131,19 @@ const MCTS_CONSTRAINT_MODE     = :penalize   # :penalize | :terminate | :off
 #       Pc→~1e-12) beats MANEUVER (fuel>0) on a feasible case. This is standard
 #       chance-constrained planning (trajectory feasibility, not a running penalty)
 #       and sharpens the ACAS-X parallel (reason about the resolved event).
-const MCTS_REWARD_MODE = :terminal        # :terminal (default) | :per_step (legacy)
+const MCTS_REWARD_MODE = :terminal        # :terminal (default) | :per_step (DEPRECATED)
+
+# ⚠️ DEPRECATED: :per_step (Grace, 2026-08-13). DO NOT USE IT FOR NEW WORK — no
+# current experiment, sweep, or figure runs it, and it does NOT express the intended
+# formulation: the chance constraint is a statement about TCA (P[Pc(TCA) > δ] < α),
+# so charging Pc at every step makes the planner pay for transient early-horizon
+# uncertainty that a future measurement resolves — i.e. it over-maneuvers and
+# destroys the wait-and-measure behavior that is the paper's central result.
+# The code path is RETAINED (not deleted) only so the older per-step figures and the
+# synthetic suites in test_belief_mcts.jl remain reproducible. Treat it as frozen
+# legacy: do not extend it, do not benchmark against it as "the method", and do not
+# add it to new sweeps. New efficiency work (e.g. MCTS_LEAF_ONLY_PC below) is
+# :terminal-only BY DESIGN and must never silently apply under :per_step.
 
 # Terminal soft over-δ penalty (only in :terminal mode). A leaf whose Pc-at-TCA
 # exceeds pomdp.pc_threshold takes this flat penalty ON TOP of −pc_weight·Pc — a
@@ -191,6 +203,51 @@ const MCTS_ROOT_RULE = :chance   # :chance (root chance constraint) | :legacy (a
 #            The correctness oracle; the ONLY valid mode once Phase 8 adds
 #            maneuver noise. See node_pc_at_tca / the FAST Σ PATH section header.
 const MCTS_SIGMA_MODE = :fast
+
+# --- LEAF-ONLY Pc: skip the to-TCA propagation at INTERNAL nodes (2026-08-13) ---
+# See notes/leaf_only_pc_investigation.md for the full call-graph audit.
+#
+# WHAT IT DOES: in :terminal reward mode, `step_reward` currently computes each
+# expanded child's Pc-at-TCA — a FULL to-TCA propagation of that node's belief
+# (Σ_TCA = Φ(now→TCA) Σ Φ(now→TCA)ᵀ, both objects) costing ~156 ms of the ~171 ms
+# per node — and then NEVER READS IT: the :terminal step reward is fuel-only
+# (r = −maneuver_cost·1[a is a burn]), UCB reads Qa/Na, the backup is r + γ·q_child,
+# and the root chance-constraint accumulators tally `leaf_pc` (the LEAF's Pc), not
+# any internal node's. So at internal nodes it is pure INSTRUMENTATION.
+# With this flag ON, internal nodes do ONLY the cheap mandatory one-step belief
+# evolution (`step_belief`: predict over ONE grid gap, then measurement correct) and
+# leave `pc = NaN`; the to-TCA propagation happens ONCE per rollout, at the LEAF,
+# where `leaf_value` computes it lazily on the NaN cache miss (unchanged code).
+#
+# WHY IT IS BEHAVIOR-NEUTRAL (in :terminal, with the guards below): the leaf reads
+# the SAME belief it would have read anyway (`step_belief` is untouched), and
+# `node_pc` draws NO randomness — so the sampled true states and observations, every
+# belief, every q, and every leaf Pc are IDENTICAL. Only WHEN the Pc is computed
+# moves (eager-at-creation → lazy-at-leaf). Expect BIT-FOR-BIT identical decisions.
+#
+# ⚠️ REQUIRES (enforced in `step_reward` / `run_sims!` — never silently applied):
+#   • reward_mode == :terminal — under the DEPRECATED :per_step, r = −pc_weight·Pc at
+#     every step, so internal-node Pc genuinely drives the search. Falls back to eager.
+#   • constraint_mode != :terminate — that mode amputates a branch on a child's
+#     `violated` flag (expand_child), so it genuinely needs internal-node Pc and
+#     leaf-only WOULD change which leaves exist. Falls back to eager.
+#   • no consumer of the per-node `.pc` / `.violated` tree instrumentation: the
+#     figure probes (treezoom_probe.jl transient-warning rings, phase6_tree_data.jl,
+#     phase6_ablation_data.jl) MUST keep this OFF or their per-node fields go NaN.
+#
+# SPEEDUP: internal nodes are (D−1)/D of all nodes for rollout depth D (progressive
+# widening at k=10 expands a new child on essentially every visit), and ~91% of
+# per-node cost is the to-TCA propagation ⇒ ~2.8× at D≈5 (8 h debris cadence) to
+# ~5.4× at D≈17 (2 h payload cadence). ESTIMATED from the header's 2026-07-22
+# ~156/171 ms measurement — re-measure before quoting. Composes with sigma_mode
+# (:fast removes the debris Σ grow; this removes the surviving satellite grow at
+# internal nodes) and with root-parallel. Unlike :fast it stays VALID at Phase 8
+# (orthogonal to process noise).
+#
+# DEFAULT OFF: opt-in until an exact-match validation run confirms the neutrality
+# argument empirically (same seed, same case, both ways ⇒ identical chosen action,
+# identical per-action p_viol / E[Pc], identical leaf-Pc set).
+const MCTS_LEAF_ONLY_PC = false   # true ⇒ skip internal-node Pc in :terminal mode
 
 # --- root-parallel MCTS knobs (efficiency pass, 2026-07-23) --------------------
 # Multiprocess root parallelization: split the simulation budget across N Julia
@@ -1014,13 +1071,22 @@ function step_reward(pomdp::SpacecraftCAPOMDP, a::CAAction, child::BeliefNode;
                      reward_mode::Symbol = MCTS_REWARD_MODE,
                      depth::Union{Int,Nothing} = nothing,
                      table::Union{SigmaTCATable,Nothing} = nothing,
-                     sigma_mode::Symbol = MCTS_SIGMA_MODE)
+                     sigma_mode::Symbol = MCTS_SIGMA_MODE,
+                     leaf_only_pc::Bool = MCTS_LEAF_ONLY_PC)
     # --- :terminal (default) — per-step reward is FUEL COST ONLY. No Pc term and
     # no per-step violation penalty: Pc is a TERMINAL quantity charged once in
     # `leaf_value` at TCA (the over-maneuvering fix). We still compute + cache the
     # child's Pc / violation flag for the tree instrumentation (and so :terminate
     # can amputate on it if a caller opts in), but they do NOT enter the reward.
     if reward_mode == :terminal
+        # LEAF-ONLY (opt-in, see MCTS_LEAF_ONLY_PC): the Pc computed here is not read
+        # by anything in :terminal mode, so skip the ~156 ms to-TCA propagation and
+        # leave pc = NaN — `leaf_value` computes it lazily IF this node ends up a leaf.
+        # NOT applied under :terminate, which amputates on `violated` (needs the flag).
+        if leaf_only_pc && constraint_mode != :terminate
+            r = a == MANEUVER ? -Float64(pomdp.maneuver_cost) : 0.0
+            return r, NaN, false
+        end
         pc = isnan(child.pc) ?
              node_pc(pomdp, child; depth = depth, table = table, sigma_mode = sigma_mode) :
              child.pc
@@ -1309,6 +1375,7 @@ function expand_child(pomdp::SpacecraftCAPOMDP, node::BeliefNode, a::CAAction,
                       depth::Union{Int,Nothing} = nothing,
                       table::Union{SigmaTCATable,Nothing} = nothing,
                       sigma_mode::Symbol = MCTS_SIGMA_MODE,
+                      leaf_only_pc::Bool = MCTS_LEAF_ONLY_PC,
                       grid::Union{DecisionGrid,Nothing} = nothing)
     # 1. propagate the sampled true state (Phase 0 dynamics). On the adaptive grid
     #    the true state advances by the SAME variable epoch gap the belief does, so
@@ -1340,7 +1407,8 @@ function expand_child(pomdp::SpacecraftCAPOMDP, node::BeliefNode, a::CAAction,
                                  constraint_mode = constraint_mode,
                                  pc_weight = pc_weight, pc_penalty = pc_penalty,
                                  reward_mode = reward_mode,
-                                 depth = depth, table = table, sigma_mode = sigma_mode)
+                                 depth = depth, table = table, sigma_mode = sigma_mode,
+                                 leaf_only_pc = leaf_only_pc)
     if constraint_mode == :terminate && violated
         child.is_terminal = true       # amputate the branch past a violation
     end
@@ -1439,6 +1507,7 @@ function simulate!(pomdp::SpacecraftCAPOMDP, node::BeliefNode, depth::Int,
                    node_depth::Int = 0,
                    table::Union{SigmaTCATable,Nothing} = nothing,
                    sigma_mode::Symbol = MCTS_SIGMA_MODE,
+                   leaf_only_pc::Bool = MCTS_LEAF_ONLY_PC,
                    grid::Union{DecisionGrid,Nothing} = nothing)
     # On the adaptive grid, a node is a LEAF once it reaches the final epoch (TCA),
     # i.e. its tree depth has consumed the whole grid — regardless of the depth
@@ -1475,6 +1544,7 @@ function simulate!(pomdp::SpacecraftCAPOMDP, node::BeliefNode, depth::Int,
                                 pc_weight = pc_weight, pc_penalty = pc_penalty,
                                 reward_mode = reward_mode, p_arrival = p_arrival,
                                 depth = child_depth, table = table, sigma_mode = sigma_mode,
+                                leaf_only_pc = leaf_only_pc,
                                 grid = grid)
         push!(kids, child)
     else
@@ -1485,7 +1555,8 @@ function simulate!(pomdp::SpacecraftCAPOMDP, node::BeliefNode, depth::Int,
                               constraint_mode = constraint_mode,
                               pc_weight = pc_weight, pc_penalty = pc_penalty,
                               reward_mode = reward_mode,
-                              depth = child_depth, table = table, sigma_mode = sigma_mode)
+                              depth = child_depth, table = table, sigma_mode = sigma_mode,
+                              leaf_only_pc = leaf_only_pc)
     end
 
     q_child, leaf_pc = simulate!(pomdp, child, depth - 1, rng;
@@ -1499,6 +1570,7 @@ function simulate!(pomdp::SpacecraftCAPOMDP, node::BeliefNode, depth::Int,
                                  p_arrival = p_arrival,
                                  node_depth = child_depth,
                                  table = table, sigma_mode = sigma_mode,
+                                 leaf_only_pc = leaf_only_pc,
                                  grid = grid)
     q = r + POMDPs.discount(pomdp) * q_child
 
@@ -1570,6 +1642,11 @@ struct MCTSPlanner
     # is identical under both — these govern ONLY the committed root action.
     α_cc::Float64
     root_rule::Symbol
+    # Skip the to-TCA Pc propagation at INTERNAL nodes (:terminal mode only; see
+    # MCTS_LEAF_ONLY_PC). Behavior-neutral opt-in speedup; ignored under :per_step
+    # and under constraint_mode = :terminate, and it blanks the per-node .pc /
+    # .violated tree instrumentation the figure probes read.
+    leaf_only_pc::Bool
     grid::Union{DecisionGrid,Nothing}
 end
 
@@ -1593,6 +1670,7 @@ function MCTSPlanner(pomdp::SpacecraftCAPOMDP;
                      p_arrival::Real = 1.0,
                      α_cc::Real = MCTS_ALPHA,
                      root_rule::Symbol = MCTS_ROOT_RULE,
+                     leaf_only_pc::Bool = MCTS_LEAF_ONLY_PC,
                      grid::Union{DecisionGrid,Nothing} = nothing)
     # On the adaptive grid the max usable depth is the number of grid steps (a
     # rollout reaches TCA there); cap max_depth to it so the depth budget never
@@ -1604,7 +1682,8 @@ function MCTSPlanner(pomdp::SpacecraftCAPOMDP;
                        constraint_mode, Float64(pc_weight), Float64(pc_penalty),
                        sigma_mode, parallel, n_workers,
                        reward_mode, Float64(terminal_penalty),
-                       Float64(p_arrival), Float64(α_cc), root_rule, grid)
+                       Float64(p_arrival), Float64(α_cc), root_rule,
+                       leaf_only_pc, grid)
 end
 
 """
@@ -1631,6 +1710,23 @@ function run_sims!(planner::MCTSPlanner, root::BeliefNode, rng::AbstractRNG;
               "but p_arrival=$(planner.p_arrival) < 1.0 makes debris arrival stochastic " *
               "per node. Use sigma_mode = :exact with probabilistic measurement arrival.")
     end
+    # LEAF-ONLY Pc is a :terminal-mode-only optimization and is incompatible with
+    # :terminate (which amputates branches on an internal node's violation flag).
+    # Fail LOUDLY rather than silently ignoring the flag or silently changing search
+    # behavior — the two guards are the whole correctness argument (see
+    # MCTS_LEAF_ONLY_PC and notes/leaf_only_pc_investigation.md).
+    if planner.leaf_only_pc
+        planner.reward_mode == :terminal || error(
+            "leaf_only_pc = true requires reward_mode = :terminal (got " *
+            ":$(planner.reward_mode)). Under :per_step the per-step reward IS " *
+            "−pc_weight·Pc, so internal-node Pc genuinely drives the search and " *
+            "skipping it would change the result. (:per_step is also DEPRECATED.)")
+        planner.constraint_mode != :terminate || error(
+            "leaf_only_pc = true is incompatible with constraint_mode = :terminate, " *
+            "which amputates a branch using an internal node's `violated` flag — " *
+            "skipping internal-node Pc would change which leaves exist. Use " *
+            "constraint_mode = :penalize (the default) or leaf_only_pc = false.")
+    end
     # Efficiency pass: under :fast, precompute the branch-invariant debris
     # Σ-at-TCA per depth ONCE (see the FAST Σ PATH section header), then look it
     # up per node instead of re-propagating the debris covariance every node.
@@ -1652,6 +1748,7 @@ function run_sims!(planner::MCTSPlanner, root::BeliefNode, rng::AbstractRNG;
                   terminal_penalty = planner.terminal_penalty,
                   p_arrival = planner.p_arrival,
                   node_depth = 0, table = table, sigma_mode = planner.sigma_mode,
+                  leaf_only_pc = planner.leaf_only_pc,
                   grid = planner.grid)
     end
     return root, table
